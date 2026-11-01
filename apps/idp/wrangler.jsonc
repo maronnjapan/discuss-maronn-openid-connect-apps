@@ -1,0 +1,25 @@
+// ローカル開発（wrangler dev）用の設定。database_id はプレースホルダのままにしておく。
+// デプロイ時は scripts/deploy.mjs（リポジトリルート）が実際の ID と ISSUER を入れた
+// wrangler.deploy.jsonc（gitignore 済み）を書き出して使う。
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "maronn-idp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  // issuer と異なるホスト名で OP が公開されないよう、プレビュー URL は無効にする。
+  "preview_urls": false,
+  "dev": { "port": 8787, "ip": "localhost" },
+  "vars": {
+    "ISSUER": "http://localhost:8787"
+  },
+  // OIDC_SIGNING_KEYS と OIDC_CLIENTS_JSON は Secret（ローカルは .dev.vars）で渡す。
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "maronn-idp",
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+  "observability": { "enabled": true }
+}

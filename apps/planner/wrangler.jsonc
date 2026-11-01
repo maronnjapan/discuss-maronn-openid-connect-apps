@@ -1,0 +1,34 @@
+// ローカル開発（wrangler dev）用の設定。database_id はプレースホルダのままにしておく。
+// デプロイ時は scripts/deploy.mjs（リポジトリルート）が実際の ID と URL を入れた
+// wrangler.deploy.jsonc（gitignore 済み）を書き出して使う。
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "maronn-planner",
+  "main": "src/index.tsx",
+  "compatibility_date": "2026-10-01",
+  // fetch() を常に公開インターネット経由にする。IdP の Worker（同じアカウントの workers.dev）
+  // へのリクエストが、同一ゾーン内の Worker 呼び出しとして拒否されないようにするため。
+  "compatibility_flags": ["global_fetch_strictly_public"],
+  "workers_dev": true,
+  "preview_urls": false,
+  "dev": { "port": 8788, "ip": "localhost" },
+  "assets": { "directory": "./public", "binding": "ASSETS" },
+  "vars": {
+    "APP_ORIGIN": "http://localhost:8788",
+    "OIDC_ISSUER": "http://localhost:8787",
+    "OIDC_CLIENT_ID": "planner",
+    "ALLOWED_SUBS": "",
+    "RUNS_PER_HOUR_LIMIT": "10",
+    "RUN_TIMEOUT_MINUTES": "360"
+  },
+  // OIDC_CLIENT_SECRET、ROUTINE_FIRE_URL、ROUTINE_TOKEN、ROUTINE_BEARER_TOKEN_HASH は Secret（ローカルは .dev.vars）で渡す。
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "maronn-planner",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "observability": { "enabled": true }
+}

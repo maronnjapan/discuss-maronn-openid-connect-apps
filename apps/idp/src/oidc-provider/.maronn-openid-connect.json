@@ -1,0 +1,28 @@
+{
+  "cliVersion": "0.15.1",
+  "framework": "hono",
+  "features": {
+    "pkce": true,
+    "refreshToken": true,
+    "introspection": true,
+    "revocation": true,
+    "requestObject": true,
+    "formPostResponseMode": true,
+    "implicitFlow": false,
+    "hybridFlow": false,
+    "par": false,
+    "tokenExchange": false,
+    "jarm": false,
+    "deviceAuthorizationGrant": false,
+    "idJag": false,
+    "ciba": false,
+    "jwtIntrospectionResponse": false,
+    "rpInitiatedLogout": true,
+    "dynamicClientRegistration": false,
+    "googleLogin": false
+  },
+  "scopes": [],
+  "db": "sql",
+  "steps": null,
+  "endpointOrder": null
+}

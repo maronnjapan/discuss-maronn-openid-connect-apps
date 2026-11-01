@@ -1,0 +1,28 @@
+{
+  "name": "@apps/idp",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "generate": "maronn-oidc generate hono --db sql --enable rp-initiated-logout --disable implicit-flow,hybrid-flow --output ./src/oidc-provider",
+    "signing-key": "tsx scripts/signing-key.ts",
+    "user": "tsx scripts/users.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "build": "wrangler deploy --dry-run --outdir dist"
+  },
+  "dependencies": {
+    "@maronn-openid-connect/core": "^0.10.0",
+    "@maronn-openid-connect/experimental": "^0.0.16",
+    "hono": "^4.13.14"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261031.1",
+    "@maronn-openid-connect/cli": "^0.15.1",
+    "@types/node": "^26.6.6",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5",
+    "wrangler": "^4.156.0"
+  }
+}
