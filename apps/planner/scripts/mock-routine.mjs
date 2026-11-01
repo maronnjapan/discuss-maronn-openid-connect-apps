@@ -188,11 +188,28 @@ export const tokenPipeline = [parseRequest, authenticateClient, verifyDpop, vali
 
 ## テスト計画
 
-\`\`\`ts
-describe('verifyDpopProof', () => {
-  it('should reject a proof whose htm does not match the request method', () => {});
-});
-\`\`\`
+### ユースケースの整理
+
+| ID | 成功・失敗 | 確かめる結果 |
+| --- | --- | --- |
+| UC-1 | 成功 | 200 と \`cnf.jkt\` 付きのアクセストークン |
+| UC-2 | 失敗 | 400 と \`error=invalid_dpop_proof\` |
+
+### ユースケースを満たす機能
+
+| ID | 機能 | 満たすユースケース | 実装する場所 |
+| --- | --- | --- | --- |
+| F-1 | DPoP proof の \`htm\` / \`htu\` / \`iat\` を検証する | UC-1、UC-2 | \`packages/core/src/dpop.ts\` の \`verifyDpopProof()\` |
+| F-2 | アクセストークンに \`cnf.jkt\` を入れる | UC-1 | \`apps/hono/src/endpoints/token/steps/verify-dpop.ts\` |
+
+### 機能ごとのテストケース
+
+| 機能 | テストの種類 | テストファイル | テストケース名 | 入力と期待する結果 | 確かめるユースケースと独自実装 |
+| --- | --- | --- | --- | --- | --- |
+| F-1 | 単体テスト | \`packages/core/src/dpop.test.ts\` | should accept a proof whose htm and htu match the request | 正しい proof → 検証に通る | UC-1 |
+| F-1 | 単体テスト | \`packages/core/src/dpop.test.ts\` | should reject a proof whose htm does not match the request method | htm が GET の proof → \`invalid_dpop_proof\` | UC-2 |
+| F-1 | 単体テスト | \`packages/core/src/dpop.test.ts\` | should accept an iat within 60 seconds | 59 秒前の iat → 通る、61 秒前 → 拒否 | UC-1、独自実装（iat の許容幅） |
+| F-2 | E2E | \`tests/e2e/dpop.spec.ts\` | should issue an access token bound to the proof key | proof 付きで \`/token\` → \`cnf.jkt\` が鍵の thumbprint | UC-1 |
 
 ## CLI・samples・ドキュメントへの影響
 

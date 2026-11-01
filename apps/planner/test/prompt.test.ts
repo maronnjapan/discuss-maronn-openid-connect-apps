@@ -177,6 +177,26 @@ describe('routinePrompt plan structure', () => {
     expect(prompt).toContain('どの応答（HTTP ステータス、error と error_description）を返すかまで描く');
   });
 
+  // The test plan traces each test case back to a feature and each feature back to a use case.
+  it('should write the test plan from the use cases to the features to the test cases', () => {
+    const prompt = routinePrompt(settings);
+    const section = prompt.slice(prompt.indexOf('10. `## テスト計画`'), prompt.indexOf('11. `## CLI'));
+    expect([...section.matchAll(/^ {4}\d+\. `(### [^`]+)`/gm)].map((match) => match[1])).toEqual([
+      '### ユースケースの整理',
+      '### ユースケースを満たす機能',
+      '### 機能ごとのテストケース',
+    ]);
+    expect(section).toContain('各ユースケースを満たすのに必要な機能を F-1、F-2… として列挙する。');
+    expect(section).toContain('どのユースケースにも 1 つ以上の機能を対応させ、どのユースケースにも対応しない機能は書かない');
+    expect(section).toContain('失敗のユースケースを満たす機能には、失敗させる入力のテストケースを必ず含める');
+  });
+
+  it('should keep the chain of use cases, features and test cases in the implementation prompt', () => {
+    expect(routinePrompt(settings)).toContain(
+      '6. `## 作業手順`：計画書のテスト計画の機能（F-n）ごとに、先に書くテストケースと、それを通す実装を並べたタスクリスト（t_wada の TDD）と、各段階で通す確認。ユースケース、機能、テストケースの対応は計画書のまま残す',
+    );
+  });
+
   it('should explain the approach with the current code and the code after the change', () => {
     const prompt = routinePrompt(settings);
     expect(prompt).toContain('言葉の説明だけで終わらせず、変更する箇所ごとに `### <変更の内容>` の見出しを立て、次の順で示す');

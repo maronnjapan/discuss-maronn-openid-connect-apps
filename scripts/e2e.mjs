@@ -237,6 +237,8 @@ await step('回答を送ると計画書が返り、Markdown として表示さ�
   // The plan names the use cases and the departures from the specifications.
   assert.match(html, /<h2 id="msg_[0-9a-f]+-h\d+">ユースケース<\/h2>/);
   assert.match(html, /<h2 id="msg_[0-9a-f]+-h\d+">仕様から外れる独自実装<\/h2>/);
+  // The test plan goes from the use cases to the features to the test cases.
+  assert.match(html, /<h3 id="msg_[0-9a-f]+-h\d+">ユースケースの整理<\/h3>[\s\S]*<h3 id="msg_[0-9a-f]+-h\d+">ユースケースを満たす機能<\/h3>[\s\S]*<h3 id="msg_[0-9a-f]+-h\d+">機能ごとのテストケース<\/h3>/);
   // The reply was composed from the answer form.
   assert.match(html, /<strong>選択:<\/strong> packages\/experimental/);
   assert.match(html, /既存の API は壊さない/);
