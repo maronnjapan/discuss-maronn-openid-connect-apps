@@ -231,7 +231,7 @@ current_plan の計画書を、Claude Code などのコーディングエージ�
 - エラー：{"kind": "error", "markdown": "理由"}
 - 途中経過：{"kind": "progress", "markdown": "1〜3 行"}（調査に時間がかかる場合、何度送っても構いません）
 
-comment_replies は、comments の各コメントへの対応です。各要素は {"id": "cmt_…", "resolved": true, "reply": "どう反映したか"} で、反映しない、または判断を保留するコメントは resolved を false にし、reply に理由を書きます。task が "plan" で comments があるときは、計画書を返すたびに全件分を書きます。
+comment_replies は、comments の各コメントへの対応です。各要素は {"id": "cmt_…", "resolved": true, "reply": "どう反映したか"} で、反映しない、または判断を保留するコメントは resolved を false にし、reply に理由を書きます。task が "plan" で comments があるときは、計画書を返すたびに全件分を書きます。質問で返すときは、まだ計画書に反映していないので、resolved をすべて false にします（planner も質問ではコメントを解決にしません）。
 
 Bearer トークンは、この環境の network secret（Secret type: Bearer）が付けます。
 エージェントのプロキシが、planner（${host}）へのリクエストに Authorization: Bearer として付けます。トークンはこのセッションからは見えません。Authorization ヘッダーを自分で付けてはいけません。

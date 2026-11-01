@@ -21,7 +21,7 @@
  * The routine receives this text wrapped in a <routine-fire-payload> block
  * that labels it untrusted.
  */
-import { sectionChanges, unifiedDiff, type SectionChanges } from '../plan-diff.js';
+import { limitSectionChanges, sectionChanges, unifiedDiff, type SectionChanges } from '../plan-diff.js';
 import type { Question } from './callback.js';
 import { ROUTINE_TEXT_LIMIT } from './fire.js';
 
@@ -135,9 +135,9 @@ export function planVersionsBySeq(messages: readonly Pick<PayloadMessage, 'seq' 
   return versions;
 }
 
-/** The changed sections without the empty lists, to keep the payload short. */
+/** The changed sections, each list cut to a few names and without the empty lists, to keep the payload short. */
 function compactChanges(changes: SectionChanges): Partial<SectionChanges> {
-  return Object.fromEntries(Object.entries(changes).filter(([, list]) => list.length > 0));
+  return Object.fromEntries(Object.entries(limitSectionChanges(changes)).filter(([, list]) => list.length > 0));
 }
 
 function conversationEntry(

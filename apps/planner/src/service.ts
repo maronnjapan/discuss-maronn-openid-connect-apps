@@ -12,10 +12,11 @@
  */
 import { randomToken, sha256Hex, timingSafeEqual } from './crypto.js';
 import {
+  addMessageWithRun,
+  addRetryRun,
   authorLabel,
   completeRunWithMessage,
   countRunsSince,
-  createRun,
   expireStaleRuns,
   findActiveRun,
   finishRun,
@@ -69,34 +70,91 @@ export async function runBlocker(
 export const taskFor = (message: Pick<MessageRow, 'kind'>): RunTask =>
   message.kind === 'prompt_request' ? 'implementation_prompt' : 'plan';
 
-/** Fires the routine for the thread's latest user message. The run records the outcome either way. */
-export async function startRun(
+export type StartOutcome<T> = ({ ok: true } & T) | { ok: false; reason: string };
+
+/**
+ * Adds a message of a person and starts the run that answers it. The message
+ * and the run are written together, only while a run may start (no run of
+ * the thread is active, the owner is under the hourly limit), so parallel
+ * posts cannot start two runs on the same version of the plan or pass the
+ * limit together. Nothing is written when the run may not start.
+ */
+export async function postMessage(
+  db: D1Database,
+  config: AppConfig,
+  input: {
+    thread: ThreadRow;
+    kind: 'request' | 'reply' | 'prompt_request';
+    title?: string | null;
+    body: string;
+    author: Author;
+    baseMessageId?: string | null;
+  },
+  fetchImpl: typeof fetch = fetch,
+): Promise<StartOutcome<{ message: MessageRow; run: RunRow }>> {
+  const blocker = await runBlocker(db, config, input.thread.owner_sub, input.thread.id);
+  if (blocker) return { ok: false, reason: blocker };
+  const token = randomToken();
+  const created = await addMessageWithRun(db, {
+    threadId: input.thread.id,
+    ownerSub: input.thread.owner_sub,
+    kind: input.kind,
+    title: input.title ?? null,
+    body: input.body,
+    author: input.author,
+    baseMessageId: input.baseMessageId ?? null,
+    run: { task: taskFor(input), callbackTokenHash: await sha256Hex(token), ttlSeconds: config.runTimeoutSeconds },
+    limit: { count: config.runsPerHourLimit, since: now() - 3600 },
+  });
+  // Another request started a run in between: say why, as the check above would have.
+  if (!created) return { ok: false, reason: (await runBlocker(db, config, input.thread.owner_sub, input.thread.id)) ?? BUSY };
+  await fireRun(db, config, { thread: input.thread, run: created.run, token, requester: input.author }, fetchImpl);
+  return { ok: true, ...created };
+}
+
+/** Starts a run again for an existing message (after a failed or expired run), under the same conditions as postMessage. */
+export async function retryRun(
   db: D1Database,
   config: AppConfig,
   input: { thread: ThreadRow; triggerMessage: MessageRow; requester: Author },
   fetchImpl: typeof fetch = fetch,
-): Promise<RunRow> {
+): Promise<StartOutcome<{ run: RunRow }>> {
+  const blocker = await runBlocker(db, config, input.thread.owner_sub, input.thread.id);
+  if (blocker) return { ok: false, reason: blocker };
   const token = randomToken();
-  const run = await createRun(db, {
+  const run = await addRetryRun(db, {
     threadId: input.thread.id,
     ownerSub: input.thread.owner_sub,
-    task: taskFor(input.triggerMessage),
     triggerMessageId: input.triggerMessage.id,
-    callbackTokenHash: await sha256Hex(token),
-    ttlSeconds: config.runTimeoutSeconds,
+    run: { task: taskFor(input.triggerMessage), callbackTokenHash: await sha256Hex(token), ttlSeconds: config.runTimeoutSeconds },
+    limit: { count: config.runsPerHourLimit, since: now() - 3600 },
   });
+  if (!run) return { ok: false, reason: (await runBlocker(db, config, input.thread.owner_sub, input.thread.id)) ?? BUSY };
+  await fireRun(db, config, { thread: input.thread, run, token, requester: input.requester }, fetchImpl);
+  return { ok: true, run };
+}
 
+const BUSY = 'ほかの依頼と重なりました。少し待ってから、もう一度送ってください。';
+
+/** Fires the routine for a run that was just created. The run records the outcome either way. */
+async function fireRun(
+  db: D1Database,
+  config: AppConfig,
+  input: { thread: ThreadRow; run: RunRow; token: string; requester: Author },
+  fetchImpl: typeof fetch,
+): Promise<void> {
+  const { thread, run } = input;
   if (!config.routine) {
     await failRun(db, run, 'ルーチンが設定されていません。ROUTINE_FIRE_URL と ROUTINE_TOKEN を設定してください（/setup を参照）。');
-    return run;
+    return;
   }
 
-  const [messages, comments] = await Promise.all([listMessages(db, input.thread.id), listComments(db, input.thread.id)]);
+  const [messages, comments] = await Promise.all([listMessages(db, thread.id), listComments(db, thread.id)]);
   const text = buildRoutinePayload({
     task: run.task,
     runId: run.id,
-    runToken: token,
-    thread: { title: input.thread.title, url: threadUrl(config, input.thread.id) },
+    runToken: input.token,
+    thread: { title: thread.title, url: threadUrl(config, thread.id) },
     requester: { sub: input.requester.sub, name: authorLabel({ author_sub: input.requester.sub, author_name: input.requester.name }) },
     messages: toPayloadMessages(messages),
     comments: toPayloadComments(comments, messages),
@@ -105,12 +163,10 @@ export async function startRun(
   const result = await fireRoutine(config.routine, text, fetchImpl);
   if (result.ok) {
     await markRunFired(db, run.id, result.sessionId, result.sessionUrl);
-    await setThreadStatus(db, input.thread.id, 'running');
   } else {
     console.warn(`[planner] fire failed for ${run.id}: ${result.status} ${result.errorType}`);
     await failRun(db, run, result.message);
   }
-  return run;
 }
 
 async function failRun(db: D1Database, run: RunRow, error: string): Promise<void> {
@@ -184,7 +240,8 @@ export async function recordCallback(
     body: message.markdown,
     questions: message.questions,
     ...(changeSummary ? { changeSummary } : {}),
-    commentReplies: message.commentReplies,
+    // Only a plan addresses comments; with questions the replies are kept, and the comments stay open.
+    commentReplies: message.kind === 'plan' ? message.commentReplies : message.commentReplies.map((reply) => ({ ...reply, resolved: false })),
     ...(message.kind === 'error' ? { error: 'Claude Code がエラーを返しました。' } : {}),
   });
   if (!recorded) return { status: 409, error: 'run_finished' };

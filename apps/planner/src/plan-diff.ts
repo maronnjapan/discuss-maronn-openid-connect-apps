@@ -95,12 +95,31 @@ export function sectionChanges(before: string, after: string): SectionChanges {
   };
 }
 
+/** How many section names each list keeps, and how long a name may be, when they are shown or sent. */
+export const SECTION_LIST_LIMIT = 20;
+const SECTION_NAME_LIMIT = 100;
+
+/**
+ * The changes with each list cut to SECTION_LIST_LIMIT names (the rest
+ * counted as 「ほか N 節」) and long headings shortened, so an edit that
+ * touches thousands of sections stays short in the routine's payload and on
+ * the page.
+ */
+export function limitSectionChanges(changes: SectionChanges): SectionChanges {
+  const limit = (names: string[]) => {
+    const kept = names.slice(0, SECTION_LIST_LIMIT).map((name) => (name.length > SECTION_NAME_LIMIT ? `${name.slice(0, SECTION_NAME_LIMIT)}…` : name));
+    return names.length > SECTION_LIST_LIMIT ? [...kept, `ほか ${names.length - SECTION_LIST_LIMIT} 節`] : kept;
+  };
+  return { changed: limit(changes.changed), added: limit(changes.added), removed: limit(changes.removed) };
+}
+
 export function hasSectionChanges(changes: SectionChanges): boolean {
   return changes.changed.length + changes.added.length + changes.removed.length > 0;
 }
 
 /** For the pages: 「概要、テスト計画を変更。リスクと対策を追加」. */
-export function describeSectionChanges(changes: SectionChanges): string {
+export function describeSectionChanges(all: SectionChanges): string {
+  const changes = limitSectionChanges(all);
   const parts = [
     changes.changed.length > 0 ? `${changes.changed.join('、')}を変更` : '',
     changes.added.length > 0 ? `${changes.added.join('、')}を追加` : '',

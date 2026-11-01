@@ -420,15 +420,29 @@ export async function countCommentsSince(db: D1Database, threadId: string, since
   return Number(row?.count ?? 0);
 }
 
-/** Adds a comment on a plan version of the thread; null when the message is not a plan of the thread. */
+/**
+ * Adds a comment on a plan version of the thread. Null when the message is
+ * not a plan of the thread, or when the thread already took `limit.count`
+ * comments since `limit.since` (checked in the insert, so parallel requests
+ * cannot pass it together).
+ */
 export async function addComment(
   db: D1Database,
-  input: { threadId: string; messageId: string; section: string | null; quote: string | null; body: string; author: Author },
+  input: {
+    threadId: string;
+    messageId: string;
+    section: string | null;
+    quote: string | null;
+    body: string;
+    author: Author;
+    limit: { count: number; since: number };
+  },
 ): Promise<CommentRow | null> {
   return db
     .prepare(
       'INSERT INTO comments (id, thread_id, message_id, section, quote, body, author_sub, author_name, created_at) ' +
-        "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM messages WHERE id = ? AND thread_id = ? AND kind = 'plan') RETURNING *",
+        "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM messages WHERE id = ? AND thread_id = ? AND kind = 'plan') " +
+        'AND (SELECT COUNT(*) FROM comments WHERE thread_id = ? AND created_at >= ?) < ? RETURNING *',
     )
     .bind(
       newId('cmt'),
@@ -442,6 +456,9 @@ export async function addComment(
       now(),
       input.messageId,
       input.threadId,
+      input.threadId,
+      input.limit.since,
+      input.limit.count,
     )
     .first<CommentRow>();
 }
@@ -474,36 +491,134 @@ export async function deleteComment(db: D1Database, threadId: string, commentId:
 // ---------------------------------------------------------------------------
 // Runs
 
-export async function createRun(
-  db: D1Database,
-  input: { threadId: string; ownerSub: string; task: RunTask; triggerMessageId: string; callbackTokenHash: string; ttlSeconds: number },
-): Promise<RunRow> {
-  const created = now();
-  const row: RunRow = {
-    id: newId('run'),
+/** What a new run needs: its task, the hash of its token, and how long its result is waited for. */
+export interface NewRun {
+  task: RunTask;
+  callbackTokenHash: string;
+  ttlSeconds: number;
+}
+
+/**
+ * The conditions a run starts under, checked in the same statement that
+ * inserts it, so parallel requests cannot pass them together (D1 runs the
+ * statements of a database one at a time): no run of the thread is active,
+ * and the owner started fewer than `limit` runs since `since`. The binds are
+ * threadId, ownerSub, since, limit.
+ */
+const RUN_ALLOWED =
+  "NOT EXISTS (SELECT 1 FROM runs WHERE thread_id = ? AND status IN ('firing', 'running')) " +
+  'AND (SELECT COUNT(*) FROM runs WHERE owner_sub = ? AND created_at >= ?) < ?';
+
+function runRow(input: { id: string; threadId: string; ownerSub: string; triggerMessageId: string; run: NewRun; created: number }): RunRow {
+  return {
+    id: input.id,
     thread_id: input.threadId,
     owner_sub: input.ownerSub,
-    task: input.task,
+    task: input.run.task,
     trigger_message_id: input.triggerMessageId,
     status: 'firing',
-    callback_token_hash: input.callbackTokenHash,
+    callback_token_hash: input.run.callbackTokenHash,
     session_id: null,
     session_url: null,
     progress_note: null,
     progress_at: null,
     error: null,
-    created_at: created,
+    created_at: input.created,
     completed_at: null,
-    expires_at: created + input.ttlSeconds,
+    expires_at: input.created + input.run.ttlSeconds,
   };
-  await db
-    .prepare(
-      'INSERT INTO runs (id, thread_id, owner_sub, task, trigger_message_id, status, callback_token_hash, created_at, expires_at) ' +
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-    )
-    .bind(row.id, row.thread_id, row.owner_sub, row.task, row.trigger_message_id, row.status, row.callback_token_hash, row.created_at, row.expires_at)
-    .run();
-  return row;
+}
+
+/**
+ * Adds a message of a person and the run that answers it, in one
+ * transaction, only while a run may start (RUN_ALLOWED). Returns null when
+ * it may not: nothing is written then.
+ */
+export async function addMessageWithRun(
+  db: D1Database,
+  input: {
+    threadId: string;
+    ownerSub: string;
+    kind: Extract<MessageKind, 'request' | 'reply' | 'prompt_request'>;
+    title?: string | null;
+    body: string;
+    author: Author;
+    baseMessageId?: string | null;
+    run: NewRun;
+    limit: { count: number; since: number };
+  },
+): Promise<{ message: MessageRow; run: RunRow } | null> {
+  const messageId = newId('msg');
+  const runId = newId('run');
+  const created = now();
+  const recorded = 'EXISTS (SELECT 1 FROM messages WHERE id = ?)';
+  const [inserted] = await db.batch<MessageRow>([
+    db
+      .prepare(
+        'INSERT INTO messages (id, thread_id, seq, run_id, role, kind, title, body, questions_json, author_sub, author_name, change_summary, base_message_id, created_at) ' +
+          "SELECT ?, ?, COALESCE((SELECT MAX(seq) FROM messages WHERE thread_id = ?), 0) + 1, NULL, 'user', ?, ?, ?, NULL, ?, ?, NULL, ?, ? " +
+          `WHERE ${RUN_ALLOWED} RETURNING *`,
+      )
+      .bind(
+        messageId,
+        input.threadId,
+        input.threadId,
+        input.kind,
+        input.title ?? null,
+        input.body,
+        input.author.sub,
+        input.author.name,
+        input.baseMessageId ?? null,
+        created,
+        input.threadId,
+        input.ownerSub,
+        input.limit.since,
+        input.limit.count,
+      ),
+    db
+      .prepare(
+        'INSERT INTO runs (id, thread_id, owner_sub, task, trigger_message_id, status, callback_token_hash, created_at, expires_at) ' +
+          `SELECT ?, ?, ?, ?, ?, 'firing', ?, ?, ? WHERE ${recorded}`,
+      )
+      .bind(runId, input.threadId, input.ownerSub, input.run.task, messageId, input.run.callbackTokenHash, created, created + input.run.ttlSeconds, messageId),
+    db.prepare(`UPDATE threads SET status = 'running', updated_at = ? WHERE id = ? AND ${recorded}`).bind(created, input.threadId, messageId),
+  ]);
+  const message = inserted?.results[0];
+  if (!message) return null;
+  return { message, run: runRow({ id: runId, threadId: input.threadId, ownerSub: input.ownerSub, triggerMessageId: messageId, run: input.run, created }) };
+}
+
+/** Starts a run again for a message that already exists (a retry), only while a run may start (RUN_ALLOWED). */
+export async function addRetryRun(
+  db: D1Database,
+  input: { threadId: string; ownerSub: string; triggerMessageId: string; run: NewRun; limit: { count: number; since: number } },
+): Promise<RunRow | null> {
+  const runId = newId('run');
+  const created = now();
+  const [inserted] = await db.batch<{ id: string }>([
+    db
+      .prepare(
+        'INSERT INTO runs (id, thread_id, owner_sub, task, trigger_message_id, status, callback_token_hash, created_at, expires_at) ' +
+          `SELECT ?, ?, ?, ?, ?, 'firing', ?, ?, ? WHERE ${RUN_ALLOWED} RETURNING id`,
+      )
+      .bind(
+        runId,
+        input.threadId,
+        input.ownerSub,
+        input.run.task,
+        input.triggerMessageId,
+        input.run.callbackTokenHash,
+        created,
+        created + input.run.ttlSeconds,
+        input.threadId,
+        input.ownerSub,
+        input.limit.since,
+        input.limit.count,
+      ),
+    db.prepare("UPDATE threads SET status = 'running', updated_at = ? WHERE id = ? AND EXISTS (SELECT 1 FROM runs WHERE id = ?)").bind(created, input.threadId, runId),
+  ]);
+  if (!inserted?.results[0]) return null;
+  return runRow({ id: runId, threadId: input.threadId, ownerSub: input.ownerSub, triggerMessageId: input.triggerMessageId, run: input.run, created });
 }
 
 export async function getRun(db: D1Database, id: string): Promise<RunRow | null> {

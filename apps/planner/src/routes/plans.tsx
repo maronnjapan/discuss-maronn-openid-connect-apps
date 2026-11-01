@@ -7,11 +7,11 @@
 import { Hono } from 'hono';
 import type { AppVariables, CurrentUser } from '../auth/session.js';
 import { composeRequest, formString, LIMITS, type NewPlanValues } from '../compose.js';
-import { addMessage, createThread, listThreads } from '../db.js';
+import { createThread, deleteThread, listThreads } from '../db.js';
 import type { AppConfig, Bindings } from '../env.js';
 import { renderMarkdown } from '../markdown.js';
 import { routineAllowedDomains, routineNetworkSecret, routinePrompt } from '../routine/prompt.js';
-import { runBlocker, startRun } from '../service.js';
+import { postMessage, runBlocker } from '../service.js';
 import { DashboardPage, NewPlanPage, SetupPage } from '../views/pages.js';
 import { ownerThreadRoutes } from './thread.js';
 
@@ -52,15 +52,12 @@ planRoutes.post('/plans', async (c) => {
 
   const author = { sub: user.sub, name: user.name ?? user.sub };
   const thread = await createThread(c.env.DB, { ownerSub: user.sub, ownerName: user.name, title: values.title });
-  const message = await addMessage(c.env.DB, {
-    threadId: thread.id,
-    role: 'user',
-    kind: 'request',
-    title: values.title,
-    body: composeRequest(values),
-    author,
-  });
-  await startRun(c.env.DB, config, { thread, triggerMessage: message, requester: author });
+  const posted = await postMessage(c.env.DB, config, { thread, kind: 'request', title: values.title, body: composeRequest(values), author });
+  if (!posted.ok) {
+    // Another request reached the hourly limit in between: keep no empty thread.
+    await deleteThread(c.env.DB, thread.id, user.sub);
+    return c.html(<NewPlanPage user={user} values={values} error={posted.reason} />, 429);
+  }
   return c.redirect(`/plans/${thread.id}`, 303);
 });
 

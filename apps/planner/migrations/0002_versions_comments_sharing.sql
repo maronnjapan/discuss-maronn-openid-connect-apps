@@ -75,3 +75,19 @@ CREATE UNIQUE INDEX threads_share_token ON threads (share_token);
 -- ルーチンの作業の種類：計画書づくり（plan）か、計画書から実装用プロンプトを作る
 -- （implementation_prompt）か。
 ALTER TABLE runs ADD COLUMN task TEXT NOT NULL DEFAULT 'plan' CHECK (task IN ('plan', 'implementation_prompt'));
+
+-- 1 つのスレッドで同時に動く run は 1 つまで。run は、作業中の run が無いことを
+-- 条件にした INSERT で作る（src/db.ts の RUN_ALLOWED）。この索引はその念押し。
+-- 以前の版で同時に動いてしまった run があれば、最も新しい 1 つを残して時間切れにする。
+UPDATE runs
+SET status = 'expired',
+    error = '同じスレッドで同時に動いていたため、時間切れとして扱いました。',
+    completed_at = CAST(strftime('%s', 'now') AS INTEGER)
+WHERE status IN ('firing', 'running')
+  AND id <> (
+    SELECT r.id FROM runs AS r
+    WHERE r.thread_id = runs.thread_id AND r.status IN ('firing', 'running')
+    ORDER BY r.created_at DESC, r.rowid DESC
+    LIMIT 1
+  );
+CREATE UNIQUE INDEX runs_one_active_per_thread ON runs (thread_id) WHERE status IN ('firing', 'running');

@@ -3,6 +3,7 @@ import {
   describeSectionChanges,
   diffHunks,
   diffLines,
+  limitSectionChanges,
   sectionChanges,
   splitSections,
   unifiedDiff,
@@ -50,6 +51,15 @@ describe('sectionChanges', () => {
 
   it('should ignore blank lines around a section', () => {
     expect(sectionChanges('## 概要\n\na\n', '## 概要\na\n\n\n')).toEqual({ changed: [], added: [], removed: [] });
+  });
+});
+
+describe('limitSectionChanges', () => {
+  it('should keep 20 names of a list, count the rest and shorten long headings', () => {
+    const names = Array.from({ length: 25 }, (_, index) => `節${index}`);
+    const limited = limitSectionChanges({ changed: names, added: ['あ'.repeat(150)], removed: [] });
+    expect(limited.changed).toEqual([...names.slice(0, 20), 'ほか 5 節']);
+    expect(limited.added).toEqual([`${'あ'.repeat(100)}…`]);
   });
 });
 

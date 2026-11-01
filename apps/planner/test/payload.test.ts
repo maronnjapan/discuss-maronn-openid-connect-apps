@@ -286,6 +286,21 @@ describe('buildRoutinePayload', () => {
       expect(parsed.comments.map((comment: { id: string }) => comment.id)).toEqual([comments[3]!.id, comments[4]!.id]);
     });
 
+    // An edit of a very long plan that touches thousands of sections still fits the fire.
+    it('should keep the changed sections short however many sections changed', () => {
+      const sections = (mark: string) => Array.from({ length: 3_000 }, (_, index) => `## 節${index}\n\n${mark}${index}`).join('\n\n');
+      const before = `# 計画\n\n${sections('旧')}`;
+      const after = `# 計画\n\n${sections('新')}`;
+      const text = buildRoutinePayload(
+        input([request, { ...plan(2, 1), body: before }, { ...plan(3, 2), role: 'user', body: after }, reply(4, 'この版で')]),
+      );
+      expect(text.length <= 64_536).toBe(true);
+      const parsed = JSON.parse(text);
+      expect(parsed.current_plan.user_changes.changed_sections.changed).toHaveLength(21);
+      expect(parsed.current_plan.user_changes.changed_sections.changed[20]).toBe('ほか 2980 節');
+      expect(parsed.conversation[2].changed_sections.changed).toHaveLength(21);
+    });
+
     it('should cut the body of a message longer than the limit and mark it', () => {
       const text = buildRoutinePayload(input([{ ...request, body: '"い"\n'.repeat(20_000) }], { maxLength: 20_000 }));
       expect(text.length <= 20_000).toBe(true);

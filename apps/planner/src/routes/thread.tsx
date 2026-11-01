@@ -18,7 +18,6 @@ import {
   ACTIVE_RUN_STATUSES,
   addComment,
   addEditedPlan,
-  addMessage,
   authorLabel,
   countCommentsSince,
   countMessages,
@@ -49,7 +48,7 @@ import type { AppConfig, Bindings } from '../env.js';
 import { renderMarkdown } from '../markdown.js';
 import { diffHunks, sectionChanges } from '../plan-diff.js';
 import { COMMENT_ID, firstHeading, LIMITS as RESULT_LIMITS } from '../routine/callback.js';
-import { runBlocker, startRun } from '../service.js';
+import { postMessage, retryRun, runBlocker } from '../service.js';
 import { ErrorPage } from '../views/pages.js';
 import { DiffPage, EditPlanPage, ThreadPage, type CommentView, type ThreadAccessView, type ThreadViewModel, type TimelineItem } from '../views/thread.js';
 
@@ -265,17 +264,15 @@ function threadRoutes(base: '/plans/:id' | '/s/:token', resolve: (c: ThreadConte
     const body = composeReply(questions, form, { openComments });
     if (!body) return renderThread(c, { error: '回答かメッセージを入力してください。' }, 400);
 
-    const author = actor(access, form);
-    const message = await addMessage(c.env.DB, {
-      threadId: thread.id,
-      role: 'user',
+    const posted = await postMessage(c.env.DB, c.get('config'), {
+      thread,
       kind: 'reply',
       body,
-      author,
+      author: actor(access, form),
       baseMessageId: latestOf(messages, 'plan')?.id ?? null,
     });
-    await startRun(c.env.DB, c.get('config'), { thread, triggerMessage: message, requester: author });
-    return c.redirect(`${basePath}#${message.id}`, 303);
+    if (!posted.ok) return renderThread(c, { error: posted.reason }, 409);
+    return c.redirect(`${basePath}#${posted.message.id}`, 303);
   });
 
   /** Fires the routine again for the latest message of a person, after a failed or expired run. */
@@ -295,7 +292,8 @@ function threadRoutes(base: '/plans/:id' | '/s/:token', resolve: (c: ThreadConte
       latestRun?.trigger_message_id === latestUserMessage.id &&
       (latestRun.status === 'failed' || latestRun.status === 'expired');
     if (!retryable) return renderThread(c, { error: '再実行できる依頼がありません。' }, 400);
-    await startRun(c.env.DB, c.get('config'), { thread, triggerMessage: latestUserMessage, requester: actor(access, await c.req.parseBody()) });
+    const retried = await retryRun(c.env.DB, c.get('config'), { thread, triggerMessage: latestUserMessage, requester: actor(access, await c.req.parseBody()) });
+    if (!retried.ok) return renderThread(c, { error: retried.reason }, 409);
     return c.redirect(basePath, 303);
   });
 
@@ -317,17 +315,15 @@ function threadRoutes(base: '/plans/:id' | '/s/:token', resolve: (c: ThreadConte
     const instructions = formString(form, 'instructions');
     if (instructions.length > LIMITS.instructions) return renderThread(c, { error: '整形の指示が長すぎます。' }, 400);
 
-    const author = actor(access, form);
-    const message = await addMessage(c.env.DB, {
-      threadId: thread.id,
-      role: 'user',
+    const posted = await postMessage(c.env.DB, c.get('config'), {
+      thread,
       kind: 'prompt_request',
       body: composePromptRequest(plans.length, instructions),
-      author,
+      author: actor(access, form),
       baseMessageId: latest.id,
     });
-    await startRun(c.env.DB, c.get('config'), { thread, triggerMessage: message, requester: author });
-    return c.redirect(`${basePath}#${message.id}`, 303);
+    if (!posted.ok) return renderThread(c, { error: posted.reason }, 409);
+    return c.redirect(`${basePath}#${posted.message.id}`, 303);
   });
 
   // --- Comments --------------------------------------------------------------
@@ -343,9 +339,9 @@ function threadRoutes(base: '/plans/:id' | '/s/:token', resolve: (c: ThreadConte
     if (body.length > LIMITS.comment || quote.length > LIMITS.quote || section.length > LIMITS.section) {
       return renderThread(c, { error: 'コメントか引用が長すぎます。' }, 400);
     }
-    if ((await countCommentsSince(c.env.DB, thread.id, now() - 3600)) >= COMMENTS_PER_HOUR_LIMIT) {
-      return renderThread(c, { error: `このスレッドへのコメントは 1 時間に ${COMMENTS_PER_HOUR_LIMIT} 件までです。しばらくしてから書いてください。` }, 429);
-    }
+    const limited = `このスレッドへのコメントは 1 時間に ${COMMENTS_PER_HOUR_LIMIT} 件までです。しばらくしてから書いてください。`;
+    const since = now() - 3600;
+    if ((await countCommentsSince(c.env.DB, thread.id, since)) >= COMMENTS_PER_HOUR_LIMIT) return renderThread(c, { error: limited }, 429);
     // Comments go on the latest version, the one the next run starts from.
     const latest = latestOf(await listMessages(c.env.DB, thread.id), 'plan');
     if (!latest || formString(form, 'message_id') !== latest.id) {
@@ -358,8 +354,10 @@ function threadRoutes(base: '/plans/:id' | '/s/:token', resolve: (c: ThreadConte
       quote: quote || null,
       body,
       author: actor(access, form),
+      limit: { count: COMMENTS_PER_HOUR_LIMIT, since },
     });
-    if (!comment) return renderThread(c, { error: 'コメントを保存できませんでした。' }, 400);
+    // The insert checks the limit again, for comments posted in parallel.
+    if (!comment) return renderThread(c, { error: limited }, 429);
     await touchThread(c.env.DB, thread.id);
     return c.redirect(`${basePath}#${comment.id}`, 303);
   });
