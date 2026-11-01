@@ -73,7 +73,11 @@ export function changeReasons({ changes, migrating, unrecorded, tokenChanged }) 
   if (changes.domains) {
     reasons.push(unrecorded ? '許可ドメインは、前回の設定の記録が無いため表示します（設定済みなら変更不要）。' : '許可ドメインが変わりました。');
   }
-  if (changes.prompt) reasons.push('ルーチンに保存するプロンプトが変わりました。');
+  if (changes.prompt) {
+    reasons.push(
+      'ルーチンに保存するプロンプトが変わりました。保存プロンプトは新旧どちらの形の依頼も受け付けるので、先に差し替えてからデプロイしてください（差し替え済みなら変更不要）。',
+    );
+  }
   return reasons;
 }
 

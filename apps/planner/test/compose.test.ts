@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { composeReply, composeRequest } from '../src/routes/plans.js';
+import { composePromptRequest, composeReply, composeRequest, guestName, REPLY_FOR_COMMENTS } from '../src/compose.js';
 
 describe('composeRequest', () => {
   it('should put the feature, the specs and the notes under their own headings', () => {
@@ -37,5 +37,35 @@ describe('composeReply', () => {
 
   it('should use the message alone for a follow-up without questions', () => {
     expect(composeReply([], { message: 'E2E を足して\r\nほしい' })).toBe('E2E を足して\nほしい');
+  });
+});
+
+describe('composeReply with open comments', () => {
+  it('should ask to address the open comments when the follow-up is left empty', () => {
+    expect(composeReply([], { message: '' }, { openComments: 2 })).toBe(REPLY_FOR_COMMENTS);
+  });
+
+  it('should still ask for answers when questions are pending', () => {
+    expect(composeReply([{ id: 'q1', question: '置き場所は？' }], {}, { openComments: 2 })).toBe(null);
+  });
+});
+
+describe('composePromptRequest', () => {
+  it('should name the plan version and add the formatting instructions under a heading', () => {
+    expect(composePromptRequest(3, 'Codex 向けに英語で')).toBe(
+      '計画書 v3 から、生成 AI に実装させるためのプロンプトを作ってください。\n\n## 整形の指示\n\nCodex 向けに英語で',
+    );
+    expect(composePromptRequest(1, '')).toBe('計画書 v1 から、生成 AI に実装させるためのプロンプトを作ってください。');
+  });
+});
+
+describe('guestName', () => {
+  it('should keep one line without control and bidirectional characters', () => {
+    expect(guestName('  Bob\n  Smith‮\u0007 ')).toBe('Bob Smith');
+  });
+
+  it('should be null when nothing is left, and cut long names', () => {
+    expect(guestName(' ​ ')).toBe(null);
+    expect(guestName('あ'.repeat(60))).toBe('あ'.repeat(40));
   });
 });

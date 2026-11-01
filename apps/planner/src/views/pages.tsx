@@ -1,15 +1,16 @@
 /** @jsxImportSource hono/jsx */
 import { raw } from 'hono/html';
 import type { CurrentUser } from '../auth/session.js';
-import type { MessageRow, RunRow, ThreadRow } from '../db.js';
-import type { Heading } from '../markdown.js';
-import type { Question } from '../routine/callback.js';
+import type { NewPlanValues } from '../compose.js';
+import type { ThreadSummaryRow } from '../db.js';
 import { Flash, formatDate, Layout, MarkdownField, StatusBadge } from './layout.js';
+
+export type { NewPlanValues } from '../compose.js';
 
 // ---------------------------------------------------------------------------
 // Dashboard
 
-export function DashboardPage(props: { user: CurrentUser; threads: ThreadRow[]; routineConfigured: boolean }) {
+export function DashboardPage(props: { user: CurrentUser; threads: ThreadSummaryRow[]; routineConfigured: boolean }) {
   return (
     <Layout title="計画一覧" user={props.user}>
       <div class="page-head">
@@ -41,6 +42,9 @@ export function DashboardPage(props: { user: CurrentUser; threads: ThreadRow[]; 
                 <span class="thread-card__title">{thread.title}</span>
                 <span class="thread-card__meta">
                   <StatusBadge status={thread.status} />
+                  {thread.has_prompt ? <span class="badge badge--prompt">実装用プロンプトあり</span> : null}
+                  {thread.open_comments > 0 ? <span class="badge badge--open">未解決のコメント {thread.open_comments}</span> : null}
+                  {thread.share_token ? <span class="badge badge--shared">共有中</span> : null}
                   <span class="muted">更新 {formatDate(thread.updated_at)}</span>
                 </span>
               </a>
@@ -54,13 +58,6 @@ export function DashboardPage(props: { user: CurrentUser; threads: ThreadRow[]; 
 
 // ---------------------------------------------------------------------------
 // New request
-
-export interface NewPlanValues {
-  title: string;
-  feature: string;
-  specs: string;
-  notes: string;
-}
 
 export function NewPlanPage(props: { user: CurrentUser; values?: Partial<NewPlanValues>; error?: string | null }) {
   const values = props.values ?? {};
@@ -120,274 +117,6 @@ export function NewPlanPage(props: { user: CurrentUser; values?: Partial<NewPlan
           </button>
         </div>
       </form>
-    </Layout>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Thread
-
-export interface TimelineItem {
-  message: MessageRow;
-  html: string;
-  headings: Heading[];
-  questions: Question[];
-  /** The latest run started for this user message. */
-  run?: RunRow;
-  /** 1 for the first plan of the thread, 2 for the next, and so on. */
-  planVersion?: number;
-}
-
-export interface ThreadPageProps {
-  user: CurrentUser;
-  thread: ThreadRow;
-  items: TimelineItem[];
-  activeRun: RunRow | null;
-  latestRun: RunRow | null;
-  pendingQuestions: TimelineItem | null;
-  latestPlan: TimelineItem | null;
-  progressHtml: string | null;
-  error?: string | null;
-  notice?: string | null;
-  pollSignature: string;
-}
-
-const RUN_STATUS_LABELS: Record<RunRow['status'], string> = {
-  firing: 'ルーチンを起動中',
-  running: 'Claude Code が作業中',
-  completed: '完了',
-  failed: '失敗',
-  expired: '時間切れ',
-};
-
-function RunInfo(props: { run: RunRow; isLatest: boolean; threadId: string; canRetry: boolean }) {
-  const { run } = props;
-  return (
-    <div class={`run-info run-info--${run.status}`}>
-      <span class="run-info__status">{RUN_STATUS_LABELS[run.status]}</span>
-      {run.session_url ? (
-        <a href={run.session_url} target="_blank" rel="noopener noreferrer">
-          Claude Code のセッションを開く ↗
-        </a>
-      ) : null}
-      {run.error ? <span class="run-info__error">{run.error}</span> : null}
-      {props.isLatest && props.canRetry && (run.status === 'failed' || run.status === 'expired') ? (
-        <form method="post" action={`/plans/${props.threadId}/retry`} class="inline-form" data-submit-once>
-          <button type="submit" class="button button--small">
-            もう一度依頼する
-          </button>
-        </form>
-      ) : null}
-    </div>
-  );
-}
-
-function Toc(props: { headings: Heading[] }) {
-  const headings = props.headings.filter((heading) => heading.level >= 2 && heading.level <= 3);
-  if (headings.length < 3) return null;
-  return (
-    <details class="toc">
-      <summary>目次</summary>
-      <ol>
-        {headings.map((heading) => (
-          <li class={`toc__item toc__item--${heading.level}`}>
-            <a href={`#${heading.id}`}>{heading.text}</a>
-          </li>
-        ))}
-      </ol>
-    </details>
-  );
-}
-
-function MessageCard(props: { item: TimelineItem; threadId: string; isLatestRun: boolean; canRetry: boolean }) {
-  const { message } = props.item;
-  const fromUser = message.role === 'user';
-  const label = fromUser
-    ? message.kind === 'request'
-      ? '依頼'
-      : '回答・追加の指示'
-    : message.kind === 'plan'
-      ? `計画書 v${props.item.planVersion ?? 1}`
-      : message.kind === 'questions'
-        ? '質問'
-        : 'エラー';
-  const rawUrl = `/plans/${props.threadId}/messages/${message.id}.md`;
-  return (
-    <article class={`message message--${message.role} message--${message.kind}`} id={message.id}>
-      <header class="message__head">
-        <span class="message__author">{fromUser ? 'あなた' : 'Claude Code'}</span>
-        <span class="message__kind">{label}</span>
-        <time class="muted" datetime={new Date(message.created_at * 1000).toISOString()}>
-          {formatDate(message.created_at)}
-        </time>
-        <span class="message__tools">
-          <button type="button" class="link-button" data-copy-url={rawUrl}>
-            Markdown をコピー
-          </button>
-          <a href={rawUrl} download>
-            .md
-          </a>
-        </span>
-      </header>
-      {message.title && !fromUser ? <p class="message__title">{message.title}</p> : null}
-      {message.kind === 'plan' ? <Toc headings={props.item.headings} /> : null}
-      <div class="markdown-body">{raw(props.item.html)}</div>
-      {props.item.questions.length > 0 ? (
-        <ol class="question-list">
-          {props.item.questions.map((question) => (
-            <li>
-              <span class="question-list__id">{question.id}</span> {question.question}
-              {question.choices?.length ? <span class="muted">（選択肢: {question.choices.join(' / ')}）</span> : null}
-            </li>
-          ))}
-        </ol>
-      ) : null}
-      {props.item.run ? (
-        <RunInfo run={props.item.run} isLatest={props.isLatestRun} threadId={props.threadId} canRetry={props.canRetry} />
-      ) : null}
-    </article>
-  );
-}
-
-function AnswerForm(props: { threadId: string; questions: Question[] }) {
-  return (
-    <form method="post" action={`/plans/${props.threadId}/messages`} class="stack reply-form" data-submit-once>
-      <h2>質問に回答する</h2>
-      {props.questions.map((question, index) => (
-        <fieldset class="answer">
-          <legend>
-            <span class="question-list__id">{question.id}</span> {question.question}
-          </legend>
-          {question.choices?.length ? (
-            <div class="choices">
-              {question.choices.map((choice) => (
-                <label class="choice">
-                  <input type="radio" name={`choice.${question.id}`} value={choice} />
-                  <span>{choice}</span>
-                </label>
-              ))}
-            </div>
-          ) : null}
-          <textarea
-            name={`answer.${question.id}`}
-            rows={3}
-            aria-label={`${question.id} への回答`}
-            placeholder={question.choices?.length ? '補足（任意）' : '回答'}
-            autofocus={index === 0 && !question.choices?.length}
-          ></textarea>
-        </fieldset>
-      ))}
-      <MarkdownField name="message" label="ほかに伝えること（任意）" rows={4} />
-      <div class="form-actions">
-        <button type="submit" class="button">
-          回答を送って計画を作り直す
-        </button>
-      </div>
-    </form>
-  );
-}
-
-function FollowUpForm(props: { threadId: string; hasPlan: boolean }) {
-  return (
-    <form method="post" action={`/plans/${props.threadId}/messages`} class="stack reply-form" data-submit-once>
-      <h2>{props.hasPlan ? '計画を直してもらう' : '追加で伝える'}</h2>
-      <MarkdownField
-        name="message"
-        label={props.hasPlan ? '修正・追加してほしい点' : 'メッセージ'}
-        rows={6}
-        required
-        placeholder={props.hasPlan ? '例：テスト計画に E2E のケースを足してほしい / Express の生成コードも対象にしたい' : ''}
-      />
-      <div class="form-actions">
-        <button type="submit" class="button">
-          Claude Code に送る
-        </button>
-      </div>
-    </form>
-  );
-}
-
-export function ThreadPage(props: ThreadPageProps) {
-  const { thread } = props;
-  const running = props.activeRun !== null;
-  const canPost = !running;
-  return (
-    <Layout
-      title={thread.title}
-      user={props.user}
-      wide
-      bodyAttributes={
-        running
-          ? { 'data-poll-url': `/plans/${thread.id}/status`, 'data-poll-signature': props.pollSignature }
-          : {}
-      }
-    >
-      <div class="page-head">
-        <div>
-          <p class="crumbs">
-            <a href="/">計画一覧</a> /
-          </p>
-          <h1>{thread.title}</h1>
-          <p class="meta">
-            <StatusBadge status={thread.status} />
-            <span class="muted">作成 {formatDate(thread.created_at)}</span>
-          </p>
-        </div>
-        <div class="page-head__actions">
-          {props.latestPlan ? (
-            <a class="button button--ghost" href={`/plans/${thread.id}/plan.md`} download>
-              最新の計画書をダウンロード
-            </a>
-          ) : null}
-          <form method="post" action={`/plans/${thread.id}/delete`} class="inline-form" data-confirm="このスレッドを削除します。よろしいですか？">
-            <button type="submit" class="button button--danger-ghost">
-              削除
-            </button>
-          </form>
-        </div>
-      </div>
-
-      {props.error ? <Flash kind="error">{props.error}</Flash> : null}
-      {props.notice ? <Flash kind="info">{props.notice}</Flash> : null}
-
-      <div class="timeline">
-        {props.items.map((item) => (
-          <MessageCard
-            item={item}
-            threadId={thread.id}
-            isLatestRun={item.run !== undefined && item.run.id === props.latestRun?.id}
-            canRetry={canPost}
-          />
-        ))}
-        {props.activeRun ? (
-          <div class="working" role="status" aria-live="polite">
-            <span class="spinner" aria-hidden="true"></span>
-            <div>
-              <p class="working__title">Claude Code がリポジトリを調べて計画を作っています</p>
-              {props.progressHtml ? <div class="markdown-body working__progress">{raw(props.progressHtml)}</div> : null}
-              <p class="muted">
-                結果が届くとこのページは自動で更新されます。
-                {props.activeRun.session_url ? (
-                  <>
-                    {' '}
-                    <a href={props.activeRun.session_url} target="_blank" rel="noopener noreferrer">
-                      作業の様子を Claude Code で見る ↗
-                    </a>
-                  </>
-                ) : null}
-              </p>
-            </div>
-          </div>
-        ) : null}
-      </div>
-
-      {canPost ? (
-        props.pendingQuestions ? (
-          <AnswerForm threadId={thread.id} questions={props.pendingQuestions.questions} />
-        ) : (
-          <FollowUpForm threadId={thread.id} hasPlan={props.latestPlan !== null} />
-        )
-      ) : null}
     </Layout>
   );
 }
@@ -488,6 +217,11 @@ export function SetupPage(props: { user: CurrentUser; status: SetupStatus; promp
             が出れば設定は完了。<code>HTTP 401</code> なら network secret、接続できなければ許可するドメインを見直す。
           </li>
         </ol>
+        <p>
+          計画書づくりと、計画書を実装用プロンプトに整形する作業は、同じルーチンが依頼の task で切り替えて行います。ルーチンは 1 つで足ります。planner
+          の更新で下のプロンプトが変わったときは、ルーチンの Edit からプロンプトを差し替えてから <code>pnpm run deploy</code>{' '}
+          を実行します（プロンプトは新旧どちらの形の依頼も受け付けるので、先に差し替えても止まりません）。
+        </p>
         <h3>許可するドメイン</h3>
         <pre>
           <code>{status.allowedDomains.join('\n')}</code>

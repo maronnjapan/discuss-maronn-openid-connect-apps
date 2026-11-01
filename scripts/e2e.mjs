@@ -2,12 +2,15 @@
 /**
  * End-to-end check of the two apps and the mock routine, as a browser would
  * use them: sign in at the IdP, ask for a plan, answer the questions, read
- * the plan, and sign out. Run it against `pnpm dev`.
+ * the plan, edit it, comment on it, share the thread and use it without
+ * signing in, turn the plan into an implementation prompt, and sign out.
+ * Run it against `pnpm dev`.
  *
  *   pnpm e2e
  *
  * The callback API is also probed with wrong tokens and a second result, and
- * the IdP with the client credentials grant it no longer has.
+ * the IdP with the client credentials grant it no longer has. The fires are
+ * read back from the mock routine to check that they carry one plan only.
  */
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
@@ -81,7 +84,7 @@ function hidden(html, name) {
 async function waitForSignature(threadPath, previous, timeoutMs = 20_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const response = await request(`${PLANNER}${threadPath}/status`);
+    const response = await request(new URL(`${threadPath}/status`, PLANNER).href);
     const data = await response.json();
     if (!data.running && data.signature !== previous) return data;
     await new Promise((resolve) => setTimeout(resolve, 500));
@@ -104,6 +107,35 @@ async function step(name, fn) {
 
 let threadPath;
 let runId;
+let shareUrl;
+let editedMarkdown;
+
+/** The fire text of a run, as the mock routine shows it for its session. */
+async function fireOf(sessionUrl) {
+  const text = await (await fetch(sessionUrl)).text();
+  return JSON.parse(text.slice(text.indexOf('{')));
+}
+
+/** The session of the latest run of the thread (the owner's page links every run). */
+async function latestSessionUrl() {
+  const html = await (await request(`${PLANNER}${threadPath}`)).text();
+  const links = [...html.matchAll(/href="(http:\/\/localhost:8790\/sessions\/session_mock_\w+)"/g)].map((match) => match[1]);
+  assert.ok(links.length > 0, 'no session link');
+  return links[links.length - 1];
+}
+
+/** A request without the cookies of the signed-in browser: a visitor of a share link. */
+function anonymous(url, init = {}) {
+  return fetch(url, { ...init, redirect: 'manual' });
+}
+
+function postAnonymously(url, fields) {
+  return anonymous(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: PLANNER },
+    body: form(fields),
+  });
+}
 // The token the network secret of the routine's environment adds (the mock's stand-in reads the same file).
 const routineBearerToken = readDevVars(join(PLANNER_DIR, '.dev.vars.mock-routine')).ROUTINE_BEARER_TOKEN;
 assert.ok(routineBearerToken, 'apps/planner/.dev.vars.mock-routine has no ROUTINE_BEARER_TOKEN; run pnpm setup:local');
@@ -212,6 +244,180 @@ await step('回答を送ると計画書が返り、Markdown として表示さ�
   const plan = await request(`${PLANNER}${threadPath}/plan.md`);
   assert.equal(plan.headers.get('Content-Type'), 'text/markdown; charset=utf-8');
   assert.match(await plan.text(), /^# DPoP 対応の実装計画\n/);
+});
+
+await step('計画書を編集すると新しい版として残り、差分を見られる', async () => {
+  const original = await (await request(`${PLANNER}${threadPath}/plan.md`)).text();
+  const editor = await request(`${PLANNER}${threadPath}/plan/edit`);
+  assert.equal(editor.status, 200);
+  const editorHtml = await editor.text();
+  assert.match(editorHtml, /v2 として保存/);
+  const base = /name="base" value="(msg_[0-9a-f]{24})"/.exec(editorHtml)?.[1];
+  assert.ok(base, 'base version not found');
+
+  editedMarkdown = original.trimEnd().replace(/## 未決事項\n\nなし$/, '## 未決事項\n\n- 本番の署名鍵の扱い（人が追記）');
+  assert.notEqual(editedMarkdown, original.trimEnd());
+  const save = await request(`${PLANNER}${threadPath}/plan`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: PLANNER },
+    body: form({ base, markdown: editedMarkdown, note: '未決事項を追記した' }),
+  });
+  assert.equal(save.status, 303);
+  assert.match(save.headers.get('Location'), /\?done=plan-saved#msg_/);
+
+  const html = await (await request(`${PLANNER}${threadPath}`)).text();
+  assert.match(html, /計画書 v2（編集）・最新/);
+  assert.match(html, /編集メモ/);
+  assert.match(html, /未決事項を追記した/);
+  // The first version is folded, the latest is open.
+  assert.match(html, /<details class="message message--assistant message--plan message--collapsed"/);
+  const diff = await (await request(`${PLANNER}${threadPath}/versions/2/diff`)).text();
+  assert.match(diff, /計画書 v1 → v2 の差分/);
+  assert.match(diff, /diff__line--add"><span class="diff__op" aria-hidden="true">\+<\/span><span class="diff__text">- 本番の署名鍵の扱い（人が追記）/);
+
+  // Saving on top of the version that was replaced is refused, and the text is kept.
+  const stale = await request(`${PLANNER}${threadPath}/plan`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: PLANNER },
+    body: form({ base, markdown: `${editedMarkdown}\n\n古い版に重ねた編集`, note: '' }),
+  });
+  assert.equal(stale.status, 409);
+  const staleHtml = await stale.text();
+  assert.match(staleHtml, /編集している間に計画書が更新されました/);
+  assert.match(staleHtml, /古い版に重ねた編集/);
+});
+
+await step('最新の計画書にコメントでき、未解決のコメントとして数えられる', async () => {
+  const html = await (await request(`${PLANNER}${threadPath}`)).text();
+  const plan = /data-comment-form="(msg_[0-9a-f]{24})"/.exec(html)?.[1];
+  assert.ok(plan, 'comment form not found');
+  const response = await request(`${PLANNER}${threadPath}/comments`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: PLANNER },
+    body: form({ message_id: plan, section: 'テスト計画', quote: 'verifyDpopProof', body: 'E2E のケースも足してほしい' }),
+  });
+  assert.equal(response.status, 303);
+  assert.match(response.headers.get('Location'), /#cmt_[0-9a-f]{24}$/);
+  const after = await (await request(`${PLANNER}${threadPath}`)).text();
+  assert.match(after, /E2E のケースも足してほしい/);
+  assert.match(after, /§ テスト計画/);
+  assert.match(after, /未解決 1 件 \/ 全 1 件/);
+
+  // People can resolve a comment and open it again.
+  const commentPath = new URL(response.headers.get('Location'), PLANNER).hash.slice(1);
+  const resolve = await request(`${PLANNER}${threadPath}/comments/${commentPath}/resolve`, { method: 'POST', headers: { Origin: PLANNER } });
+  assert.equal(resolve.status, 303);
+  assert.match(await (await request(`${PLANNER}${threadPath}`)).text(), /Test User が解決/);
+  const reopen = await request(`${PLANNER}${threadPath}/comments/${commentPath}/reopen`, { method: 'POST', headers: { Origin: PLANNER } });
+  assert.equal(reopen.status, 303);
+  assert.match(await (await request(`${PLANNER}${threadPath}`)).text(), /未解決 1 件 \/ 全 1 件/);
+});
+
+await step('共有リンクを作ると、ログインせずに閲覧とコメントができ、作成者だけの操作はできない', async () => {
+  const create = await request(`${PLANNER}${threadPath}/share`, { method: 'POST', headers: { Origin: PLANNER } });
+  assert.equal(create.status, 303);
+  const html = await (await request(`${PLANNER}${threadPath}?done=share-created`)).text();
+  assert.match(html, /共有リンクを作りました/);
+  shareUrl = new RegExp(`value="(${PLANNER}/s/[A-Za-z0-9_-]{43})"`).exec(html)?.[1];
+  assert.ok(shareUrl, 'share URL not found');
+
+  const page = await anonymous(shareUrl);
+  assert.equal(page.status, 200);
+  assert.equal(page.headers.get('X-Robots-Tag'), 'noindex, nofollow');
+  const shared = await page.text();
+  assert.match(shared, /共有リンクで表示しています/);
+  assert.match(shared, /計画書 v2（編集）・最新/);
+  assert.match(shared, /E2E のケースも足してほしい/);
+  assert.doesNotMatch(shared, /このスレッドを削除します/);
+  assert.doesNotMatch(shared, /編集する<\/a>/);
+  assert.doesNotMatch(shared, /Claude Code のセッションを開く/);
+
+  assert.equal((await anonymous(`${shareUrl}/plan/edit`)).status, 404);
+  assert.equal((await postAnonymously(`${shareUrl}/delete`, {})).status, 404);
+  assert.equal((await postAnonymously(`${shareUrl}/share/delete`, {})).status, 404);
+  assert.equal((await anonymous(`${PLANNER}/s/${'x'.repeat(43)}`)).status, 404);
+
+  const plan = /data-comment-form="(msg_[0-9a-f]{24})"/.exec(shared)?.[1];
+  const comment = await postAnonymously(`${shareUrl}/comments`, { message_id: plan, section: '', body: 'ゲストからの指摘です', author_name: 'Bob' });
+  assert.equal(comment.status, 303);
+  assert.ok(comment.headers.get('Location').startsWith(new URL(shareUrl).pathname));
+  const after = await (await anonymous(shareUrl)).text();
+  assert.match(after, /Bob（ゲスト）/);
+  assert.match(after, /ゲストからの指摘です/);
+});
+
+await step('共有リンクからの投稿でルーチンが動き、依頼には最新の計画書 1 版と変更の経緯、コメントだけが入る', async () => {
+  const before = await (await anonymous(`${shareUrl}/status`)).json();
+  const post = await postAnonymously(`${shareUrl}/messages`, { message: 'リスクと対策も厚くしてほしい', author_name: 'Bob' });
+  assert.equal(post.status, 303);
+  const status = await waitForSignature(new URL(shareUrl).pathname, before.signature);
+  assert.equal(status.status, 'plan_ready');
+
+  const fire = await fireOf(await latestSessionUrl());
+  assert.equal(fire.version, 3);
+  assert.equal(fire.task, 'plan');
+  assert.equal(fire.requester.name, 'Bob（ゲスト）');
+  assert.equal(fire.current_plan.version, 2);
+  assert.equal(fire.current_plan.edited_by_user, true);
+  assert.equal(fire.current_plan.markdown, editedMarkdown);
+  assert.equal(fire.current_plan.user_changes.since_version, 1);
+  assert.deepEqual(fire.current_plan.user_changes.changed_sections, { changed: ['未決事項'] });
+  assert.match(fire.current_plan.user_changes.diff, /\+- 本番の署名鍵の扱い（人が追記）/);
+  const plans = fire.conversation.filter((message) => message.kind === 'plan');
+  assert.deepEqual(plans.map((message) => [message.plan_version, message.role, message.body_omitted, 'body' in message]), [
+    [1, 'assistant', true, false],
+    [2, 'user', true, false],
+  ]);
+  assert.equal(plans[0].changes, '初版');
+  assert.equal(plans[1].changes, '未決事項を追記した');
+  // The whole fire holds the text of one version only.
+  assert.equal(JSON.stringify(fire).split('## 仕様から外れる独自実装').length - 1, 1);
+  assert.deepEqual(fire.comments.map((comment) => [comment.plan_version, comment.section ?? null, comment.body]), [
+    [2, 'テスト計画', 'E2E のケースも足してほしい'],
+    [2, null, 'ゲストからの指摘です'],
+  ]);
+
+  const html = await (await anonymous(shareUrl)).text();
+  assert.match(html, /計画書 v3・最新/);
+  assert.match(html, /plans の受け口で取得した v2 の本文は current_plan と一致した/);
+  // Claude Code built on the edited version and answered the comments.
+  assert.match(html, /本番の署名鍵の扱い（人が追記）/);
+  assert.match(html, /Claude Code が計画書に反映して解決/);
+  assert.match(html, /Claude Code の返答/);
+  assert.match(html, /未解決 0 件 \/ 全 2 件/);
+});
+
+await step('計画書から実装用プロンプトを作れる（整形は Claude Code に任せる）', async () => {
+  const html = await (await request(`${PLANNER}${threadPath}`)).text();
+  const base = /name="base" value="(msg_[0-9a-f]{24})"/.exec(html)?.[1];
+  assert.ok(base, 'prompt form not found');
+  const before = await (await request(`${PLANNER}${threadPath}/status`)).json();
+  const response = await request(`${PLANNER}${threadPath}/prompt`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: PLANNER },
+    body: form({ base, instructions: 'Claude Code に渡す前提で' }),
+  });
+  assert.equal(response.status, 303);
+  const status = await waitForSignature(threadPath, before.signature);
+  assert.equal(status.status, 'plan_ready');
+
+  const fire = await fireOf(await latestSessionUrl());
+  assert.equal(fire.task, 'implementation_prompt');
+  assert.equal(fire.current_plan.version, 3);
+  assert.match(fire.conversation[fire.conversation.length - 1].body, /計画書 v3 から、生成 AI に実装させるためのプロンプトを作ってください。\n\n## 整形の指示\n\nClaude Code に渡す前提で/);
+
+  const page = await (await request(`${PLANNER}${threadPath}`)).text();
+  assert.match(page, /実装用プロンプト（計画書 v3 から）/);
+  assert.match(page, /<h1 id="msg_[0-9a-f]+-h1">DPoP 対応を実装する<\/h1>/);
+  assert.match(page, /整形メモ/);
+  assert.match(page, /プロンプトをコピー/);
+});
+
+await step('共有をやめると、共有リンクは使えなくなる', async () => {
+  const response = await request(`${PLANNER}${threadPath}/share/delete`, { method: 'POST', headers: { Origin: PLANNER } });
+  assert.equal(response.status, 303);
+  assert.equal((await anonymous(shareUrl)).status, 404);
+  assert.equal((await postAnonymously(`${shareUrl}/comments`, { body: 'x' })).status, 404);
 });
 
 await step('IdP は client credentials グラントを扱わない（ルーチンは IdP を使わない）', async () => {

@@ -25,6 +25,8 @@ export function Layout(props: {
   /** Attributes for <body>, such as the polling URL of a running thread. */
   bodyAttributes?: Record<string, string>;
   wide?: boolean;
+  /** Shown in the header instead of the menu, for a visitor of a share link. */
+  headerNote?: string;
   children?: Child;
 }) {
   return (
@@ -59,6 +61,8 @@ export function Layout(props: {
                     </button>
                   </form>
                 </nav>
+              ) : props.headerNote ? (
+                <span class="site-header__note">{props.headerNote}</span>
               ) : null}
             </div>
           </header>
@@ -97,10 +101,17 @@ export function MarkdownField(props: {
   required?: boolean;
   placeholder?: string;
   hint?: string;
+  maxlength?: number;
+  /** Where the preview is rendered: /api/preview for signed-in pages, the share link's own for visitors. */
+  previewUrl?: string;
+  /** Distinguishes two fields of the same name on one page. */
+  idSuffix?: string;
+  /** A monospace editor, for a whole plan with its code and diagrams. */
+  monospace?: boolean;
 }) {
-  const id = `field-${props.name.replace(/[^A-Za-z0-9_-]/g, '-')}`;
+  const id = `field-${props.name.replace(/[^A-Za-z0-9_-]/g, '-')}${props.idSuffix ? `-${props.idSuffix}` : ''}`;
   return (
-    <div class="field md-field" data-md-field>
+    <div class="field md-field" data-md-field data-preview-url={props.previewUrl ?? '/api/preview'}>
       <div class="md-field__head">
         <label for={id}>{props.label}</label>
         <div class="md-field__tabs" role="tablist">
@@ -118,6 +129,8 @@ export function MarkdownField(props: {
         rows={props.rows ?? 8}
         required={props.required}
         placeholder={props.placeholder}
+        maxlength={props.maxlength}
+        class={props.monospace ? 'code-area' : undefined}
         data-md-input
       >
         {props.value ?? ''}

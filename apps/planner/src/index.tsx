@@ -6,7 +6,10 @@
  * A request fires the Claude Code routine (src/routine/fire.ts). The routine
  * reads the repository in its cloud session and sends the plan, or the
  * questions it needs answered first, back to /api/routine/runs/... where this
- * app stores it and shows it as Markdown.
+ * app stores it and shows it as Markdown. People edit and comment on the
+ * plan, and once it holds, the routine turns it into a prompt for an AI
+ * coding agent. A thread can be shared: anyone with its URL (/s/{token})
+ * reads it, posts and comments without signing in.
  */
 import { Hono } from 'hono';
 import { csrf } from 'hono/csrf';
@@ -16,6 +19,7 @@ import { ConfigError, readConfig, type Bindings } from './env.js';
 import { authRoutes } from './routes/auth.js';
 import { planRoutes } from './routes/plans.js';
 import { routineApi } from './routes/routine-api.js';
+import { sharedThreadRoutes } from './routes/thread.js';
 import { ErrorPage } from './views/pages.js';
 
 type AppEnv = { Bindings: Bindings; Variables: AppVariables };
@@ -75,6 +79,9 @@ app.route('/', routineApi);
 app.use('*', csrf({ origin: (origin, c) => origin === c.get('config').appOrigin }));
 
 app.route('/', authRoutes);
+
+// The share links: no sign-in, the URL is the key.
+app.route('/', sharedThreadRoutes);
 
 app.use('*', requireUser());
 app.route('/', planRoutes);

@@ -7,11 +7,16 @@
  * response), then does what the routine's saved prompt
  * (src/routine/prompt.ts) tells the Claude Code session to do:
  *
- *   1. check the JSON request (type, version, run_id, run_token); a fire
- *      without text is the check of the settings, which only pings
+ *   1. check the JSON request (type, version 3 or 2, task, run_id,
+ *      run_token); a fire without text is the check of the settings, which
+ *      only pings
  *   2. ping the planner, to check that the bearer token arrives
- *   3. post a progress note, then questions (for a first request) or a plan,
- *      to the planner with the run token
+ *   3. post a progress note, then, with the run token:
+ *      - task "plan": questions (for a first request) or a plan. A plan
+ *        builds on current_plan (the latest version, people's edits
+ *        included), says what changed (changes) and answers every open
+ *        comment (comment_replies)
+ *      - task "implementation_prompt": the plan turned into a prompt
  *
  * The session adds no Authorization header, as in the real routine. The
  * bearer token comes from agentProxy() below, which plays the agent proxy of
@@ -67,13 +72,15 @@ function readRequest(text) {
   } catch {
     return null;
   }
+  const task = request?.version === 2 ? 'plan' : request?.task;
   const valid =
     request?.type === 'maronn-planner.plan-request' &&
-    request.version === 2 &&
+    (request.version === 3 || request.version === 2) &&
+    (task === 'plan' || task === 'implementation_prompt') &&
     /^run_[0-9a-f]{24}$/.test(request.run_id ?? '') &&
     /^[A-Za-z0-9_-]{43}$/.test(request.run_token ?? '') &&
     Array.isArray(request.conversation);
-  return valid ? request : null;
+  return valid ? { ...request, task } : null;
 }
 
 function questionsResult(title) {
@@ -108,6 +115,28 @@ ${title}を、既存のステップ関数の構成に沿って追加する。検
 | UC-1 | RP の開発者 | トークンを要求する | DPoP proof を付けて \`/token\` を呼ぶ | \`cnf.jkt\` 付きのアクセストークンを受け取る |
 | UC-2 | RP の開発者 | proof の \`htm\` が違う | 誤った proof で \`/token\` を呼ぶ | \`invalid_dpop_proof\` で拒否される |
 
+### UC-1 DPoP proof 付きでトークンを受け取る
+
+\`\`\`mermaid
+sequenceDiagram
+  participant RP
+  participant OP as OP (/token)
+  RP->>OP: POST /token + DPoP header
+  OP->>OP: verifyDpopProof()
+  OP-->>RP: 200 access_token (cnf.jkt)
+\`\`\`
+
+### UC-2 htm が違う proof を拒否する
+
+\`\`\`mermaid
+sequenceDiagram
+  participant RP
+  participant OP as OP (/token)
+  RP->>OP: POST /token + DPoP header (htm: GET)
+  OP->>OP: verifyDpopProof() が htm の不一致を検出
+  OP-->>RP: 400 error=invalid_dpop_proof
+\`\`\`
+
 ## 関連する仕様
 
 | 仕様 | 節 | 要件 |
@@ -122,14 +151,21 @@ ${title}を、既存のステップ関数の構成に沿って追加する。検
 
 ## 実装方針
 
-\`\`\`mermaid
-sequenceDiagram
-  participant RP
-  participant OP as OP (/token)
-  RP->>OP: POST /token + DPoP header
-  OP->>OP: verifyDpopProof()
-  OP-->>RP: access_token (cnf.jkt)
+### トークンエンドポイントのパイプラインに DPoP の検証を足す
+
+今のコード（\`endpoints/token/pipeline.ts\` の \`tokenPipeline\`）：
+
+\`\`\`ts
+export const tokenPipeline = [parseRequest, authenticateClient, validateGrantType, issueAccessToken];
 \`\`\`
+
+変更後のコード：
+
+\`\`\`ts
+export const tokenPipeline = [parseRequest, authenticateClient, verifyDpop, validateGrantType, issueAccessToken];
+\`\`\`
+
+何が変わるか：クライアント認証の後で proof を検証し、不正なら grant の検証より前に \`invalid_dpop_proof\` を返す。
 
 ## 仕様から外れる独自実装
 
@@ -169,7 +205,76 @@ describe('verifyDpopProof', () => {
 ## 未決事項
 
 なし`;
-  return { kind: 'plan', title: `${title}の実装計画`, markdown };
+  return { kind: 'plan', title: `${title}の実装計画`, markdown, changes: '初版' };
+}
+
+/**
+ * The next version of current_plan: its text as it is (people's edits
+ * included), with what this round adds. Like the routine when the text was
+ * left out of the fire, it reads the version from the planner too, and says
+ * in changes whether that text matched current_plan.
+ */
+async function revisedPlanResult(request, fetchPlan) {
+  const current = request.current_plan;
+  const fetched = await fetchPlan(current.version);
+  current.markdown ??= fetched ?? '';
+  const latest = [...request.conversation].reverse().find((message) => message.role === 'user' && message.kind !== 'plan');
+  const asked = (latest?.body ?? '').split('\n').find((line) => line.trim() !== '' && !line.startsWith('#'))?.trim() ?? '追加の指示';
+  const comments = request.comments ?? [];
+  const note = `- v${current.version + 1}：「${asked.slice(0, 60)}」${comments.length > 0 ? `とコメント ${comments.length} 件` : ''}を反映した。`;
+  const markdown = /^## 未決事項$/m.test(current.markdown)
+    ? current.markdown.replace(/^## 未決事項$/m, `${note}\n\n## 未決事項`)
+    : `${current.markdown}\n\n${note}`;
+  return {
+    kind: 'plan',
+    title: current.title ?? request.thread?.title ?? '計画',
+    markdown,
+    changes: `v${current.version}${current.edited_by_user ? '（人が編集した版）' : ''}を元に、${comments.length > 0 ? `コメント ${comments.length} 件と` : ''}最後の発言を反映した。plans の受け口で取得した v${current.version} の本文は current_plan と${fetched === current.markdown ? '一致した' : '一致しなかった'}。`,
+    comment_replies: comments.map((comment) => ({ id: comment.id, resolved: true, reply: `v${current.version + 1} に反映しました（${comment.section ?? '計画書全体'}）。` })),
+  };
+}
+
+function implementationPromptResult(request) {
+  const plan = request.current_plan;
+  const title = (plan?.title ?? request.thread?.title ?? '機能').replace(/の実装計画$/, '');
+  const comments = request.comments ?? [];
+  const markdown = `# ${title}を実装する
+
+## 目的
+
+計画書 v${plan?.version ?? '?'} のとおりに ${title} を実装する。
+
+## 前提
+
+- リポジトリは maronnjapan/maronn-openid-connect。最初に README.md の「実装におけるルール」と「テストコードの書き方」を読む。
+
+## 仕様の要件
+
+- RFC 9449 §4.3：proof の htm / htu / iat を検証する（MUST）
+
+## 変更の内容
+
+\`\`\`ts
+export const tokenPipeline = [parseRequest, authenticateClient, verifyDpop, validateGrantType, issueAccessToken];
+\`\`\`
+
+## 作業手順
+
+- [ ] 失敗するテストを先に書く
+- [ ] 実装してテストを通す
+
+## 完了の条件
+
+- \`pnpm test\` と型チェックが通る
+
+## やらないこと
+
+- 計画書の範囲外のファイルを変更しない
+
+## 判断に迷ったとき
+
+${comments.length > 0 ? comments.map((comment) => `- 未解決の指摘：${comment.body}`).join('\n') : '- 計画書の未決事項は無い'}`;
+  return { kind: 'implementation_prompt', title: `${title}を実装する`, markdown, notes: '計画書と現在のコードの食い違いは見つからなかった。' };
 }
 
 /**
@@ -191,6 +296,14 @@ async function ping(credentials, proxiedFetch) {
   const response = await proxiedFetch(`${credentials.PLANNER_ORIGIN}/api/routine/ping`);
   console.log(`[mock-routine] GET /api/routine/ping -> ${response.status} ${(await response.text()).slice(0, 200)}`);
   return response.ok;
+}
+
+/** GET /api/routine/runs/{runId}/plans/{version}: one version of the plan, as the saved prompt lets the routine read it. */
+async function fetchPlanVersion(credentials, proxiedFetch, request, version) {
+  const url = `${credentials.PLANNER_ORIGIN}/api/routine/runs/${request.run_id}/plans/${version}`;
+  const response = await proxiedFetch(url, { headers: { 'X-Planner-Run-Token': request.run_token } });
+  console.log(`[mock-routine] GET ${url} -> ${response.status}`);
+  return response.ok ? (await response.text()).replace(/\n$/, '') : null;
 }
 
 async function post(credentials, proxiedFetch, request, body) {
@@ -224,6 +337,9 @@ async function runSession(id, text) {
     return;
   }
   const title = request.thread?.title ?? '機能';
+  // The fire carries one plan in full (current_plan); the plans in the conversation have no body.
+  const plansWithBody = request.conversation.filter((message) => message.kind === 'plan' && typeof message.body === 'string').length;
+  console.log(`[mock-routine] v${request.version} task=${request.task}, current plan v${request.current_plan?.version ?? '-'}, plans with a body in the conversation: ${plansWithBody}, open comments: ${(request.comments ?? []).length}`);
   await new Promise((resolve) => setTimeout(resolve, DELAY / 2));
   await post(credentials, proxiedFetch, request, { kind: 'progress', markdown: 'リポジトリの `packages/core` と `apps/hono` を読んでいます。' });
   await new Promise((resolve) => setTimeout(resolve, DELAY / 2));
@@ -231,8 +347,15 @@ async function runSession(id, text) {
     await post(credentials, proxiedFetch, request, { kind: 'error', markdown: 'モックのエラーです。' });
     return;
   }
-  const isFirstRequest = request.conversation.length === 1;
-  const result = MODE === 'questions-then-plan' && isFirstRequest ? questionsResult(title) : planResult(title);
+  let result;
+  if (request.task === 'implementation_prompt') {
+    result = implementationPromptResult(request);
+  } else if (request.current_plan) {
+    result = await revisedPlanResult(request, (version) => fetchPlanVersion(credentials, proxiedFetch, request, version));
+  } else {
+    const isFirstRequest = request.conversation.length === 1;
+    result = MODE === 'questions-then-plan' && isFirstRequest ? questionsResult(title) : planResult(title);
+  }
   await post(credentials, proxiedFetch, request, result);
   sessions.get(id).done = true;
 }

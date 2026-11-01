@@ -1,7 +1,7 @@
-/** Reads and writes the tables of migrations/0001_init.sql. */
+/** Reads and writes the tables of migrations/ (0001_init.sql, 0002_versions_comments_sharing.sql). */
 import { newId } from './crypto.js';
-import type { Question } from './routine/callback.js';
-import type { MessageKind, PayloadMessage } from './routine/payload.js';
+import type { CommentReply, Question } from './routine/callback.js';
+import type { MessageKind, PayloadComment, PayloadMessage, RunTask } from './routine/payload.js';
 
 export const now = () => Math.floor(Date.now() / 1000);
 
@@ -34,6 +34,21 @@ export interface ThreadRow {
   status: ThreadStatus;
   created_at: number;
   updated_at: number;
+  /** The token of the share link (/s/{token}); null while the thread is not shared. */
+  share_token: string | null;
+  shared_at: number | null;
+}
+
+/** A thread on the list of plans, with what the list shows besides its status. */
+export interface ThreadSummaryRow extends ThreadRow {
+  open_comments: number;
+  has_prompt: number;
+}
+
+/** Who wrote a message or a comment: a signed-in user, or a visitor of a share link (no sub). */
+export interface Author {
+  sub: string | null;
+  name: string | null;
 }
 
 export interface MessageRow {
@@ -41,18 +56,46 @@ export interface MessageRow {
   thread_id: string;
   seq: number;
   run_id: string | null;
+  /** A plan with role user is a version people edited. */
   role: 'user' | 'assistant';
   kind: MessageKind;
   title: string | null;
   body: string;
   questions_json: string | null;
+  author_sub: string | null;
+  author_name: string | null;
+  /** Plans: what changed and why. Implementation prompts: the notes of the formatting. */
+  change_summary: string | null;
+  /** The plan version (message id) the message builds on. */
+  base_message_id: string | null;
   created_at: number;
+}
+
+export interface CommentRow {
+  id: string;
+  thread_id: string;
+  /** The plan version the comment is on. */
+  message_id: string;
+  section: string | null;
+  quote: string | null;
+  body: string;
+  author_sub: string | null;
+  author_name: string | null;
+  created_at: number;
+  resolved_at: number | null;
+  resolved_by: 'user' | 'assistant' | null;
+  resolved_by_name: string | null;
+  reply: string | null;
+  reply_run_id: string | null;
+  reply_at: number | null;
 }
 
 export interface RunRow {
   id: string;
   thread_id: string;
+  /** The owner of the thread, whose hourly limit the run counts against (also when a visitor of a share link started it). */
   owner_sub: string;
+  task: RunTask;
   trigger_message_id: string;
   status: RunStatus;
   callback_token_hash: string;
@@ -77,17 +120,55 @@ export function messageQuestions(message: Pick<MessageRow, 'questions_json'>): Q
   }
 }
 
-export function toPayloadMessage(message: MessageRow): PayloadMessage {
-  const questions = messageQuestions(message);
-  return {
-    seq: message.seq,
-    role: message.role,
-    kind: message.kind,
-    title: message.title,
-    body: message.body,
-    createdAt: message.created_at,
-    ...(questions.length > 0 ? { questions } : {}),
-  };
+/** How a writer is shown: the name, marked as a guest for a visitor of a share link (who signs in nowhere). */
+export function authorLabel(author: { author_sub: string | null; author_name: string | null }): string {
+  if (author.author_sub === null) return author.author_name ? `${author.author_name}（ゲスト）` : 'ゲスト';
+  return author.author_name || author.author_sub;
+}
+
+/** The plan versions of a thread by message id: 1 for the first plan, 2 for the next, and so on. */
+export function planVersionsById(messages: readonly Pick<MessageRow, 'id' | 'kind'>[]): Map<string, number> {
+  const versions = new Map<string, number>();
+  for (const message of messages) if (message.kind === 'plan') versions.set(message.id, versions.size + 1);
+  return versions;
+}
+
+export function toPayloadMessages(messages: readonly MessageRow[]): PayloadMessage[] {
+  const versions = planVersionsById(messages);
+  return messages.map((message) => {
+    const questions = messageQuestions(message);
+    const basePlanVersion = message.base_message_id ? versions.get(message.base_message_id) : undefined;
+    return {
+      seq: message.seq,
+      role: message.role,
+      kind: message.kind,
+      title: message.title,
+      body: message.body,
+      createdAt: message.created_at,
+      ...(message.role === 'user' ? { author: authorLabel(message) } : {}),
+      ...(message.change_summary ? { changeSummary: message.change_summary } : {}),
+      ...((message.kind === 'prompt_request' || message.kind === 'implementation_prompt') && basePlanVersion
+        ? { basePlanVersion }
+        : {}),
+      ...(questions.length > 0 ? { questions } : {}),
+    };
+  });
+}
+
+/** The open comments of a thread, as the routine receives them. */
+export function toPayloadComments(comments: readonly CommentRow[], messages: readonly MessageRow[]): PayloadComment[] {
+  const versions = planVersionsById(messages);
+  return comments
+    .filter((comment) => comment.resolved_at === null)
+    .map((comment) => ({
+      id: comment.id,
+      planVersion: versions.get(comment.message_id) ?? 0,
+      section: comment.section,
+      quote: comment.quote,
+      body: comment.body,
+      author: authorLabel(comment),
+      createdAt: comment.created_at,
+    }));
 }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +229,8 @@ export async function createThread(
     status: 'running',
     created_at: created,
     updated_at: created,
+    share_token: null,
+    shared_at: null,
   };
   await db
     .prepare('INSERT INTO threads (id, owner_sub, owner_name, title, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
@@ -156,11 +239,16 @@ export async function createThread(
   return row;
 }
 
-export async function listThreads(db: D1Database, ownerSub: string): Promise<ThreadRow[]> {
+export async function listThreads(db: D1Database, ownerSub: string): Promise<ThreadSummaryRow[]> {
   const { results } = await db
-    .prepare('SELECT * FROM threads WHERE owner_sub = ? ORDER BY updated_at DESC LIMIT 200')
+    .prepare(
+      'SELECT t.*, ' +
+        '(SELECT COUNT(*) FROM comments AS c WHERE c.thread_id = t.id AND c.resolved_at IS NULL) AS open_comments, ' +
+        "EXISTS (SELECT 1 FROM messages AS m WHERE m.thread_id = t.id AND m.kind = 'implementation_prompt') AS has_prompt " +
+        'FROM threads AS t WHERE t.owner_sub = ? ORDER BY t.updated_at DESC LIMIT 200',
+    )
     .bind(ownerSub)
-    .all<ThreadRow>();
+    .all<ThreadSummaryRow>();
   return results;
 }
 
@@ -172,8 +260,28 @@ export async function getThreadById(db: D1Database, id: string): Promise<ThreadR
   return db.prepare('SELECT * FROM threads WHERE id = ?').bind(id).first<ThreadRow>();
 }
 
+export const SHARE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+
+export async function getThreadByShareToken(db: D1Database, token: string): Promise<ThreadRow | null> {
+  if (!SHARE_TOKEN_PATTERN.test(token)) return null;
+  return db.prepare('SELECT * FROM threads WHERE share_token = ?').bind(token).first<ThreadRow>();
+}
+
+/** Starts sharing a thread with a new token, or stops it (null). The old URL stops working either way. */
+export async function setShareToken(db: D1Database, id: string, ownerSub: string, token: string | null): Promise<boolean> {
+  const result = await db
+    .prepare('UPDATE threads SET share_token = ?, shared_at = ? WHERE id = ? AND owner_sub = ?')
+    .bind(token, token === null ? null : now(), id, ownerSub)
+    .run();
+  return result.meta.changes > 0;
+}
+
 export async function setThreadStatus(db: D1Database, id: string, status: ThreadStatus): Promise<void> {
   await db.prepare('UPDATE threads SET status = ?, updated_at = ? WHERE id = ?').bind(status, now(), id).run();
+}
+
+export async function touchThread(db: D1Database, id: string): Promise<void> {
+  await db.prepare('UPDATE threads SET updated_at = ? WHERE id = ?').bind(now(), id).run();
 }
 
 export async function deleteThread(db: D1Database, id: string, ownerSub: string): Promise<boolean> {
@@ -181,16 +289,19 @@ export async function deleteThread(db: D1Database, id: string, ownerSub: string)
   return result.meta.changes > 0;
 }
 
+/** Adds a message of a person: a request, a reply, a request for an implementation prompt, or an edited plan. */
 export async function addMessage(
   db: D1Database,
   input: {
     threadId: string;
-    runId?: string | null;
     role: MessageRow['role'];
     kind: MessageKind;
     title?: string | null;
     body: string;
     questions?: Question[];
+    author?: Author | null;
+    changeSummary?: string | null;
+    baseMessageId?: string | null;
   },
 ): Promise<MessageRow> {
   const id = newId('msg');
@@ -200,24 +311,77 @@ export async function addMessage(
   // messages of one thread never get the same number (UNIQUE (thread_id, seq)).
   const row = await db
     .prepare(
-      'INSERT INTO messages (id, thread_id, seq, run_id, role, kind, title, body, questions_json, created_at) ' +
-        'SELECT ?, ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ?, ?, ?, ? FROM messages WHERE thread_id = ? RETURNING *',
+      'INSERT INTO messages (id, thread_id, seq, run_id, role, kind, title, body, questions_json, author_sub, author_name, change_summary, base_message_id, created_at) ' +
+        'SELECT ?, ?, COALESCE(MAX(seq), 0) + 1, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM messages WHERE thread_id = ? RETURNING *',
     )
     .bind(
       id,
       input.threadId,
-      input.runId ?? null,
       input.role,
       input.kind,
       input.title ?? null,
       input.body,
       questionsJson,
+      input.author?.sub ?? null,
+      input.author?.name ?? null,
+      input.changeSummary ?? null,
+      input.baseMessageId ?? null,
       created,
       input.threadId,
     )
     .first<MessageRow>();
   if (!row) throw new Error('Failed to insert the message');
   return row;
+}
+
+/**
+ * Saves a version of the plan people edited, unless the plan changed since
+ * they opened it (another edit, or a plan from Claude Code) or a run is
+ * active (its result would replace the edit). Returns null in those cases.
+ */
+export async function addEditedPlan(
+  db: D1Database,
+  input: { threadId: string; baseMessageId: string; title: string | null; body: string; note: string | null; author: Author; resolveCommentIds: string[] },
+): Promise<MessageRow | null> {
+  const id = newId('msg');
+  const created = now();
+  const latestPlan = "(SELECT id FROM messages WHERE thread_id = ? AND kind = 'plan' ORDER BY seq DESC LIMIT 1)";
+  const noActiveRun = "NOT EXISTS (SELECT 1 FROM runs WHERE thread_id = ? AND status IN ('firing', 'running'))";
+  const [inserted] = await db.batch<MessageRow>([
+    db
+      .prepare(
+        'INSERT INTO messages (id, thread_id, seq, run_id, role, kind, title, body, questions_json, author_sub, author_name, change_summary, base_message_id, created_at) ' +
+          "SELECT ?, ?, COALESCE((SELECT MAX(seq) FROM messages WHERE thread_id = ?), 0) + 1, NULL, 'user', 'plan', ?, ?, NULL, ?, ?, ?, ?, ? " +
+          `WHERE ${latestPlan} = ? AND ${noActiveRun} RETURNING *`,
+      )
+      .bind(
+        id,
+        input.threadId,
+        input.threadId,
+        input.title,
+        input.body,
+        input.author.sub,
+        input.author.name,
+        input.note,
+        input.baseMessageId,
+        created,
+        input.threadId,
+        input.baseMessageId,
+        input.threadId,
+      ),
+    db
+      .prepare('UPDATE threads SET updated_at = ? WHERE id = ? AND EXISTS (SELECT 1 FROM messages WHERE id = ?)')
+      .bind(created, input.threadId, id),
+    ...input.resolveCommentIds.map((commentId) =>
+      db
+        .prepare(
+          "UPDATE comments SET resolved_at = ?, resolved_by = 'user', resolved_by_name = ? " +
+            'WHERE id = ? AND thread_id = ? AND resolved_at IS NULL AND EXISTS (SELECT 1 FROM messages WHERE id = ?)',
+        )
+        .bind(created, input.author.name, commentId, input.threadId, id),
+    ),
+  ]);
+  return inserted?.results[0] ?? null;
 }
 
 export async function listMessages(db: D1Database, threadId: string): Promise<MessageRow[]> {
@@ -228,8 +392,83 @@ export async function listMessages(db: D1Database, threadId: string): Promise<Me
   return results;
 }
 
+export async function countMessages(db: D1Database, threadId: string): Promise<number> {
+  const row = await db.prepare('SELECT COUNT(*) AS count FROM messages WHERE thread_id = ?').bind(threadId).first<{ count: number }>();
+  return Number(row?.count ?? 0);
+}
+
 export async function getMessage(db: D1Database, threadId: string, id: string): Promise<MessageRow | null> {
   return db.prepare('SELECT * FROM messages WHERE thread_id = ? AND id = ?').bind(threadId, id).first<MessageRow>();
+}
+
+// ---------------------------------------------------------------------------
+// Comments
+
+export async function listComments(db: D1Database, threadId: string): Promise<CommentRow[]> {
+  const { results } = await db
+    .prepare('SELECT * FROM comments WHERE thread_id = ? ORDER BY created_at, rowid')
+    .bind(threadId)
+    .all<CommentRow>();
+  return results;
+}
+
+export async function countCommentsSince(db: D1Database, threadId: string, since: number): Promise<number> {
+  const row = await db
+    .prepare('SELECT COUNT(*) AS count FROM comments WHERE thread_id = ? AND created_at >= ?')
+    .bind(threadId, since)
+    .first<{ count: number }>();
+  return Number(row?.count ?? 0);
+}
+
+/** Adds a comment on a plan version of the thread; null when the message is not a plan of the thread. */
+export async function addComment(
+  db: D1Database,
+  input: { threadId: string; messageId: string; section: string | null; quote: string | null; body: string; author: Author },
+): Promise<CommentRow | null> {
+  return db
+    .prepare(
+      'INSERT INTO comments (id, thread_id, message_id, section, quote, body, author_sub, author_name, created_at) ' +
+        "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM messages WHERE id = ? AND thread_id = ? AND kind = 'plan') RETURNING *",
+    )
+    .bind(
+      newId('cmt'),
+      input.threadId,
+      input.messageId,
+      input.section,
+      input.quote,
+      input.body,
+      input.author.sub,
+      input.author.name,
+      now(),
+      input.messageId,
+      input.threadId,
+    )
+    .first<CommentRow>();
+}
+
+/** Marks a comment as resolved by a person, or open again (resolvedBy null). */
+export async function setCommentResolved(
+  db: D1Database,
+  threadId: string,
+  commentId: string,
+  resolvedBy: { name: string | null } | null,
+): Promise<boolean> {
+  const result =
+    resolvedBy === null
+      ? await db
+          .prepare('UPDATE comments SET resolved_at = NULL, resolved_by = NULL, resolved_by_name = NULL WHERE id = ? AND thread_id = ?')
+          .bind(commentId, threadId)
+          .run()
+      : await db
+          .prepare("UPDATE comments SET resolved_at = ?, resolved_by = 'user', resolved_by_name = ? WHERE id = ? AND thread_id = ? AND resolved_at IS NULL")
+          .bind(now(), resolvedBy.name, commentId, threadId)
+          .run();
+  return result.meta.changes > 0;
+}
+
+export async function deleteComment(db: D1Database, threadId: string, commentId: string): Promise<boolean> {
+  const result = await db.prepare('DELETE FROM comments WHERE id = ? AND thread_id = ?').bind(commentId, threadId).run();
+  return result.meta.changes > 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -237,13 +476,14 @@ export async function getMessage(db: D1Database, threadId: string, id: string): 
 
 export async function createRun(
   db: D1Database,
-  input: { threadId: string; ownerSub: string; triggerMessageId: string; callbackTokenHash: string; ttlSeconds: number },
+  input: { threadId: string; ownerSub: string; task: RunTask; triggerMessageId: string; callbackTokenHash: string; ttlSeconds: number },
 ): Promise<RunRow> {
   const created = now();
   const row: RunRow = {
     id: newId('run'),
     thread_id: input.threadId,
     owner_sub: input.ownerSub,
+    task: input.task,
     trigger_message_id: input.triggerMessageId,
     status: 'firing',
     callback_token_hash: input.callbackTokenHash,
@@ -258,10 +498,10 @@ export async function createRun(
   };
   await db
     .prepare(
-      'INSERT INTO runs (id, thread_id, owner_sub, trigger_message_id, status, callback_token_hash, created_at, expires_at) ' +
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO runs (id, thread_id, owner_sub, task, trigger_message_id, status, callback_token_hash, created_at, expires_at) ' +
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
     )
-    .bind(row.id, row.thread_id, row.owner_sub, row.trigger_message_id, row.status, row.callback_token_hash, row.created_at, row.expires_at)
+    .bind(row.id, row.thread_id, row.owner_sub, row.task, row.trigger_message_id, row.status, row.callback_token_hash, row.created_at, row.expires_at)
     .run();
   return row;
 }
@@ -320,10 +560,12 @@ export async function finishRun(
 
 /**
  * Records the result of a run in one transaction (a D1 batch): the
- * assistant's message, the end of the run and the thread's new status. The
- * message is inserted only while the run is active, so of two callbacks for
- * the same run only the first one is recorded. Returns the message, or null
- * when the run was no longer active.
+ * assistant's message, the end of the run, the thread's new status and the
+ * replies to the comments. The message is inserted only while the run is
+ * active, so of two callbacks for the same run only the first one is
+ * recorded. It builds on the latest plan, which cannot change while the run
+ * is active (people cannot edit the plan meanwhile). Returns the message, or
+ * null when the run was no longer active.
  */
 export async function completeRunWithMessage(
   db: D1Database,
@@ -335,6 +577,8 @@ export async function completeRunWithMessage(
     title?: string;
     body: string;
     questions: Question[];
+    changeSummary?: string;
+    commentReplies?: CommentReply[];
     error?: string;
   },
 ): Promise<MessageRow | null> {
@@ -342,17 +586,55 @@ export async function completeRunWithMessage(
   const created = now();
   const questionsJson = input.questions.length > 0 ? JSON.stringify(input.questions) : null;
   const active = "EXISTS (SELECT 1 FROM runs WHERE id = ? AND status IN ('firing', 'running'))";
+  const latestPlan = "(SELECT id FROM messages WHERE thread_id = ? AND kind = 'plan' ORDER BY seq DESC LIMIT 1)";
+  const recorded = 'EXISTS (SELECT 1 FROM messages WHERE id = ?)';
   const [inserted] = await db.batch<MessageRow>([
     db
       .prepare(
-        'INSERT INTO messages (id, thread_id, seq, run_id, role, kind, title, body, questions_json, created_at) ' +
-          "SELECT ?, ?, COALESCE((SELECT MAX(seq) FROM messages WHERE thread_id = ?), 0) + 1, ?, 'assistant', ?, ?, ?, ?, ? " +
+        'INSERT INTO messages (id, thread_id, seq, run_id, role, kind, title, body, questions_json, author_sub, author_name, change_summary, base_message_id, created_at) ' +
+          `SELECT ?, ?, COALESCE((SELECT MAX(seq) FROM messages WHERE thread_id = ?), 0) + 1, ?, 'assistant', ?, ?, ?, ?, NULL, NULL, ?, ${latestPlan}, ? ` +
           `WHERE ${active} RETURNING *`,
       )
-      .bind(id, input.run.thread_id, input.run.thread_id, input.run.id, input.kind, input.title ?? null, input.body, questionsJson, created, input.run.id),
+      .bind(
+        id,
+        input.run.thread_id,
+        input.run.thread_id,
+        input.run.id,
+        input.kind,
+        input.title ?? null,
+        input.body,
+        questionsJson,
+        input.changeSummary ?? null,
+        input.run.thread_id,
+        created,
+        input.run.id,
+      ),
     db
-      .prepare('UPDATE threads SET status = ?, updated_at = ? WHERE id = ? AND EXISTS (SELECT 1 FROM messages WHERE id = ?)')
+      .prepare(`UPDATE threads SET status = ?, updated_at = ? WHERE id = ? AND ${recorded}`)
       .bind(input.threadStatus, created, input.run.thread_id, id),
+    // The replies of Claude Code; "resolved" closes a comment people have not closed yet.
+    ...(input.commentReplies ?? []).map((reply) =>
+      db
+        .prepare(
+          'UPDATE comments SET reply = ?, reply_run_id = ?, reply_at = ?, ' +
+            "resolved_at = CASE WHEN ? = 1 AND resolved_at IS NULL THEN ? ELSE resolved_at END, " +
+            "resolved_by = CASE WHEN ? = 1 AND resolved_at IS NULL THEN 'assistant' ELSE resolved_by END, " +
+            'resolved_by_name = CASE WHEN ? = 1 AND resolved_at IS NULL THEN NULL ELSE resolved_by_name END ' +
+            `WHERE id = ? AND thread_id = ? AND ${recorded}`,
+        )
+        .bind(
+          reply.reply,
+          input.run.id,
+          created,
+          reply.resolved ? 1 : 0,
+          created,
+          reply.resolved ? 1 : 0,
+          reply.resolved ? 1 : 0,
+          reply.id,
+          input.run.thread_id,
+          id,
+        ),
+    ),
     db
       .prepare("UPDATE runs SET status = ?, error = ?, completed_at = ? WHERE id = ? AND status IN ('firing', 'running')")
       .bind(input.runStatus, input.error ?? null, created, input.run.id),

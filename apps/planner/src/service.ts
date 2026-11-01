@@ -1,7 +1,9 @@
 /**
  * Starting routine runs and recording what they send back.
  *
- * A run is one fire of the routine for the latest user message of a thread.
+ * A run is one fire of the routine for the latest user message of a thread:
+ * a request or a reply (task "plan"), or a request for an implementation
+ * prompt (task "implementation_prompt").
  * Each run has its own token (the run token), sent in the fire and expected
  * back with the result in the X-Planner-Run-Token header next to the
  * routine's access token. Only its SHA-256 is stored, and it is accepted while
@@ -10,6 +12,7 @@
  */
 import { randomToken, sha256Hex, timingSafeEqual } from './crypto.js';
 import {
+  authorLabel,
   completeRunWithMessage,
   countRunsSince,
   createRun,
@@ -18,58 +21,66 @@ import {
   finishRun,
   getRun,
   getThreadById,
+  listComments,
   listMessages,
   markRunFired,
   now,
   setRunProgress,
   setThreadStatus,
-  toPayloadMessage,
+  toPayloadComments,
+  toPayloadMessages,
+  type Author,
   type MessageRow,
   type RunRow,
   type ThreadRow,
   type ThreadStatus,
 } from './db.js';
 import type { AppConfig } from './env.js';
-import type { CurrentUser } from './auth/session.js';
-import type { CallbackMessage } from './routine/callback.js';
+import { CALLBACK_KINDS_BY_TASK, type CallbackMessage } from './routine/callback.js';
 import { fireRoutine } from './routine/fire.js';
-import { buildRoutinePayload } from './routine/payload.js';
+import { buildRoutinePayload, type RunTask } from './routine/payload.js';
 
 export const threadUrl = (config: AppConfig, threadId: string) => `${config.appOrigin}/plans/${threadId}`;
 
 /**
- * Whether the user may start a run on this thread now: no run of the thread
- * is active, and the user is under the hourly limit. Returns the reason
+ * Whether a run may start on this thread now: no run of the thread is
+ * active, and the thread's owner is under the hourly limit (runs started by
+ * visitors of a share link count against the owner too). Returns the reason
  * when not.
  */
 export async function runBlocker(
   db: D1Database,
   config: AppConfig,
-  user: CurrentUser,
+  ownerSub: string,
   threadId: string | null,
 ): Promise<string | null> {
   if (threadId) {
     await expireStaleRuns(db, threadId);
     if (await findActiveRun(db, threadId)) return 'このスレッドでは Claude Code が作業中です。結果が返るまでお待ちください。';
   }
-  const recent = await countRunsSince(db, user.sub, now() - 3600);
+  const recent = await countRunsSince(db, ownerSub, now() - 3600);
   if (recent >= config.runsPerHourLimit) {
     return `1 時間あたりの依頼回数の上限（${config.runsPerHourLimit} 回）に達しました。しばらくしてから送ってください。`;
   }
   return null;
 }
 
+/** The task of a run started for a message: a request for an implementation prompt, or work on the plan. */
+export const taskFor = (message: Pick<MessageRow, 'kind'>): RunTask =>
+  message.kind === 'prompt_request' ? 'implementation_prompt' : 'plan';
+
 /** Fires the routine for the thread's latest user message. The run records the outcome either way. */
 export async function startRun(
   db: D1Database,
   config: AppConfig,
-  input: { thread: ThreadRow; triggerMessage: MessageRow; user: CurrentUser },
+  input: { thread: ThreadRow; triggerMessage: MessageRow; requester: Author },
   fetchImpl: typeof fetch = fetch,
 ): Promise<RunRow> {
   const token = randomToken();
   const run = await createRun(db, {
     threadId: input.thread.id,
-    ownerSub: input.user.sub,
+    ownerSub: input.thread.owner_sub,
+    task: taskFor(input.triggerMessage),
     triggerMessageId: input.triggerMessage.id,
     callbackTokenHash: await sha256Hex(token),
     ttlSeconds: config.runTimeoutSeconds,
@@ -80,13 +91,15 @@ export async function startRun(
     return run;
   }
 
-  const messages = await listMessages(db, input.thread.id);
+  const [messages, comments] = await Promise.all([listMessages(db, input.thread.id), listComments(db, input.thread.id)]);
   const text = buildRoutinePayload({
+    task: run.task,
     runId: run.id,
     runToken: token,
     thread: { title: input.thread.title, url: threadUrl(config, input.thread.id) },
-    requester: { sub: input.user.sub, name: input.user.name },
-    messages: messages.map(toPayloadMessage),
+    requester: { sub: input.requester.sub, name: authorLabel({ author_sub: input.requester.sub, author_name: input.requester.name }) },
+    messages: toPayloadMessages(messages),
+    comments: toPayloadComments(comments, messages),
   });
 
   const result = await fireRoutine(config.routine, text, fetchImpl);
@@ -108,6 +121,7 @@ async function failRun(db: D1Database, run: RunRow, error: string): Promise<void
 export type CallbackOutcome =
   | { status: 201; messageId: string; threadUrl: string }
   | { status: 202 }
+  | { status: 400; error: 'invalid_request'; description: string }
   | { status: 401 | 404 | 409 | 410; error: string };
 
 /** Checks a callback's run token against the run (after its access token was verified). */
@@ -137,6 +151,8 @@ const THREAD_STATUS_BY_KIND: Record<Exclude<CallbackMessage['kind'], 'progress'>
   plan: 'plan_ready',
   questions: 'awaiting_answer',
   error: 'failed',
+  // The plan stays as it was; the prompt is made from it.
+  implementation_prompt: 'plan_ready',
 };
 
 export async function recordCallback(
@@ -145,11 +161,20 @@ export async function recordCallback(
   run: RunRow,
   message: CallbackMessage,
 ): Promise<CallbackOutcome> {
+  const allowed: readonly string[] = CALLBACK_KINDS_BY_TASK[run.task];
+  if (!allowed.includes(message.kind)) {
+    return {
+      status: 400,
+      error: 'invalid_request',
+      description: `"kind" must be one of ${allowed.join(', ')} for this run (task "${run.task}").`,
+    };
+  }
   if (message.kind === 'progress') {
     return (await setRunProgress(db, run.id, message.markdown))
       ? { status: 202 }
       : { status: 409, error: 'run_finished' };
   }
+  const changeSummary = message.kind === 'plan' ? message.changes : message.kind === 'implementation_prompt' ? message.notes : undefined;
   const recorded = await completeRunWithMessage(db, {
     run,
     runStatus: message.kind === 'error' ? 'failed' : 'completed',
@@ -158,6 +183,8 @@ export async function recordCallback(
     ...(message.title ? { title: message.title } : {}),
     body: message.markdown,
     questions: message.questions,
+    ...(changeSummary ? { changeSummary } : {}),
+    commentReplies: message.commentReplies,
     ...(message.kind === 'error' ? { error: 'Claude Code がエラーを返しました。' } : {}),
   });
   if (!recorded) return { status: 409, error: 'run_finished' };

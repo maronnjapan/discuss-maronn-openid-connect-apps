@@ -9,7 +9,72 @@ describe('parseCallbackBody', () => {
     it('should accept a plan and take its title from the first heading when none is given', () => {
       expect(json({ kind: 'plan', markdown: '# DPoP の実装計画\r\n\r\n## 概要\n' })).toEqual({
         ok: true,
-        message: { kind: 'plan', title: 'DPoP の実装計画', markdown: '# DPoP の実装計画\n\n## 概要', questions: [] },
+        message: { kind: 'plan', title: 'DPoP の実装計画', markdown: '# DPoP の実装計画\n\n## 概要', questions: [], commentReplies: [] },
+      });
+    });
+
+    it('should accept the changes of a plan and the replies to comments', () => {
+      expect(
+        json({
+          kind: 'plan',
+          markdown: '# 計画 v2',
+          changes: '  E2E を追加した\r\n',
+          comment_replies: [
+            { id: 'cmt_0123456789abcdef01234567', resolved: true, reply: 'テスト計画に追加した' },
+            { id: 'cmt_89abcdef0123456789abcdef', resolved: false, reply: '仕様の範囲外なので見送る' },
+          ],
+        }),
+      ).toEqual({
+        ok: true,
+        message: {
+          kind: 'plan',
+          title: '計画 v2',
+          markdown: '# 計画 v2',
+          questions: [],
+          changes: 'E2E を追加した',
+          commentReplies: [
+            { id: 'cmt_0123456789abcdef01234567', resolved: true, reply: 'テスト計画に追加した' },
+            { id: 'cmt_89abcdef0123456789abcdef', resolved: false, reply: '仕様の範囲外なので見送る' },
+          ],
+        },
+      });
+    });
+
+    it('should accept an implementation prompt with notes and take its title from the first heading', () => {
+      expect(json({ kind: 'implementation_prompt', markdown: '# DPoP を実装する\n\n## 目的', notes: '計画と現状のずれは無い' })).toEqual({
+        ok: true,
+        message: {
+          kind: 'implementation_prompt',
+          title: 'DPoP を実装する',
+          markdown: '# DPoP を実装する\n\n## 目的',
+          questions: [],
+          notes: '計画と現状のずれは無い',
+          commentReplies: [],
+        },
+      });
+    });
+
+    it('should reject fields of another kind', () => {
+      expect(json({ kind: 'questions', markdown: 'x', changes: 'y' })).toEqual({ ok: false, error: '"changes" is only allowed with kind "plan".' });
+      expect(json({ kind: 'plan', markdown: 'x', notes: 'y' })).toEqual({ ok: false, error: '"notes" is only allowed with kind "implementation_prompt".' });
+      expect(json({ kind: 'implementation_prompt', markdown: 'x', comment_replies: [] })).toEqual({
+        ok: false,
+        error: '"comment_replies" is only allowed with kind "plan" or "questions".',
+      });
+    });
+
+    it('should reject a comment reply without a valid id, a resolved flag or a reply', () => {
+      expect(json({ kind: 'plan', markdown: 'x', comment_replies: [{ id: 'cmt_1', resolved: true, reply: 'a' }] })).toEqual({
+        ok: false,
+        error: 'comment_replies[0].id must be a comment id (cmt_ and 24 hex digits).',
+      });
+      expect(json({ kind: 'plan', markdown: 'x', comment_replies: [{ id: 'cmt_0123456789abcdef01234567', reply: 'a' }] })).toEqual({
+        ok: false,
+        error: 'comment_replies[0].resolved must be true or false.',
+      });
+      expect(json({ kind: 'plan', markdown: 'x', comment_replies: [{ id: 'cmt_0123456789abcdef01234567', resolved: false, reply: ' ' }] })).toEqual({
+        ok: false,
+        error: 'comment_replies[0].reply must be a non-empty string.',
       });
     });
 
@@ -34,6 +99,7 @@ describe('parseCallbackBody', () => {
             { id: 'q1', question: 'nonce は必須にしますか？', choices: ['必須', '任意'] },
             { id: 'q2', question: '対象のフレームワークは？' },
           ],
+          commentReplies: [],
         },
       });
     });
@@ -41,7 +107,7 @@ describe('parseCallbackBody', () => {
     it('should reject an unknown kind', () => {
       expect(json({ kind: 'done', markdown: 'x' })).toEqual({
         ok: false,
-        error: '"kind" must be one of plan, questions, progress, error.',
+        error: '"kind" must be one of plan, questions, progress, error, implementation_prompt.',
       });
     });
 
@@ -78,7 +144,7 @@ describe('parseCallbackBody', () => {
     it('should take kind and title from the query string', () => {
       expect(parseCallbackBody('text/markdown; charset=utf-8', '# 計画\n本文', new URLSearchParams('kind=plan&title=PAR'))).toEqual({
         ok: true,
-        message: { kind: 'plan', title: 'PAR', markdown: '# 計画\n本文', questions: [] },
+        message: { kind: 'plan', title: 'PAR', markdown: '# 計画\n本文', questions: [], commentReplies: [] },
       });
     });
 
