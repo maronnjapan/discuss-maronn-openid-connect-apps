@@ -147,7 +147,8 @@ curl -sS -w '\\nHTTP %{http_code}\\n' '${ping}'
 - 計画書は人が planner で直接編集することがあります。conversation で role が "user" の計画書は、人が編集した版です。current_plan.edited_by_user が true なら、人が編集したその版が正です。current_plan.user_changes（あなたが最後に返した版からの変更。diff は unified 形式）を読み、人が書き換えた箇所を元に戻しません。
 - current_plan.markdown_omitted が true の場合は、本文を GET ${runs}/<run_id>/plans/<current_plan.version> で取得します。
 - 古い版の本文は読みません。ユーザーが古い版の内容に触れたとき（「v1 の案に戻して」など）だけ、その版を GET ${runs}/<run_id>/plans/<版の番号> で 1 つずつ取得します。複数の版をまとめて取得しません。
-- comments は、計画書に付いた未解決のコメントです（id、plan_version、section（節の見出し）、quote（引用した箇所）、body、author）。計画書へのレビューの指摘として扱います。
+- comments は、計画書に付いた未解決のコメントです（id、plan_version、section（節の見出し）、line と excerpt（コメントした場所）、quote（引用した箇所）、body、author）。計画書へのレビューの指摘として扱います。
+- line は、plan_version の版の Markdown で、コメントしたブロック（見出し、段落、リストの項目、表、コードブロック）が始まる行（1 始まり）、excerpt はそのブロックの Markdown を 1 行にした冒頭です。quote があれば、そのブロックの中の（選択が前のブロックから続く場合はそこからの）その文字列が指摘の対象です。line の無いコメントは、計画書全体（section があればその節）への指摘です。plan_version が current_plan.version より前のコメントでは、line はその版の行なので、excerpt と quote を手がかりに current_plan の該当箇所を探します（そのために古い版を取得しません）。
 - omitted_seq に番号がある場合は、長さの都合で省いた発言です。comments_omitted が 1 以上なら、載せきれなかったコメントがあります。どちらも、必要なら GET ${runs}/<run_id>/context で取得します（この Markdown にも、古い版の計画書の本文は含みません）。
 - version 2 の依頼には current_plan と comments が無く、計画書の本文は conversation の各要素の body にあります。最後の kind: "plan" が最新版です。
 

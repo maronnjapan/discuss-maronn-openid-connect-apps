@@ -28,6 +28,7 @@ import {
   getMessage,
   getThread,
   getThreadByShareToken,
+  latestPlanId,
   listComments,
   listMessages,
   listRuns,
@@ -45,7 +46,7 @@ import {
   type ThreadRow,
 } from '../db.js';
 import type { AppConfig, Bindings } from '../env.js';
-import { renderMarkdown } from '../markdown.js';
+import { planBlocks, renderMarkdown, type PlanBlock } from '../markdown.js';
 import { diffHunks, sectionChanges } from '../plan-diff.js';
 import { COMMENT_ID, firstHeading, LIMITS as RESULT_LIMITS } from '../routine/callback.js';
 import { postMessage, retryRun, runBlocker } from '../service.js';
@@ -117,6 +118,31 @@ function commentView(comment: CommentRow): CommentView {
   };
 }
 
+/**
+ * Where the comments on a plan version show: under the block they are on, by
+ * its line. A comment from before comments had a place, or whose line names
+ * no block (the renderer changed), goes under the heading of its section.
+ * The rest are on the whole plan.
+ */
+export function placeComments(views: CommentView[], blocks: PlanBlock[]): { threads: Map<number, CommentView[]>; rest: CommentView[] } {
+  const lines = new Set(blocks.map((block) => block.line));
+  const sectionHeadings = new Map<string, number>();
+  for (const block of blocks) {
+    if (block.kind === 'heading' && block.level === 2 && block.text !== undefined && !sectionHeadings.has(block.text)) {
+      sectionHeadings.set(block.text, block.line);
+    }
+  }
+  const threads = new Map<number, CommentView[]>();
+  const rest: CommentView[] = [];
+  for (const view of views) {
+    const { anchor_line: anchor, section } = view.comment;
+    const line = anchor !== null && lines.has(anchor) ? anchor : section ? (sectionHeadings.get(section) ?? null) : null;
+    if (line === null) rest.push(view);
+    else threads.set(line, [...(threads.get(line) ?? []), view]);
+  }
+  return { threads, rest };
+}
+
 /** Marks a run whose result never came as expired, and the thread as failed. */
 async function expireRuns(db: D1Database, thread: ThreadRow): Promise<void> {
   if (await expireStaleRuns(db, thread.id)) {
@@ -142,7 +168,8 @@ export async function loadThreadView(db: D1Database, thread: ThreadRow): Promise
 
   let previousPlan: MessageRow | undefined;
   const items: TimelineItem[] = messages.map((message) => {
-    const rendered = renderMarkdown(message.body, { idPrefix: message.id });
+    // A plan is rendered with its blocks, where people comment and where the comments show.
+    const rendered = renderMarkdown(message.body, { idPrefix: message.id, blocks: message.kind === 'plan' });
     const run = latestRunByMessage.get(message.id);
     const item: TimelineItem = {
       message,
@@ -157,6 +184,10 @@ export async function loadThreadView(db: D1Database, thread: ThreadRow): Promise
       item.isLatest = message.id === latestPlanId;
       if (previousPlan) item.sectionChanges = sectionChanges(previousPlan.body, message.body);
       item.comments = (commentsByPlan.get(message.id) ?? []).map(commentView);
+      item.blocks = rendered.blocks;
+      const placed = placeComments(item.comments, rendered.blocks);
+      item.threads = placed.threads;
+      item.planComments = placed.rest;
       previousPlan = message;
     }
     if (message.kind === 'implementation_prompt') item.isLatest = message.id === latestPromptId;
@@ -238,13 +269,22 @@ function threadRoutes(base: '/plans/:id' | '/s/:token', resolve: (c: ThreadConte
     return renderThread(c, { notice: NOTICES[done] ?? null, openSharePanel: done.startsWith('share-') });
   });
 
-  /** Polled by public/assets/app.js every few seconds while a run is active: no rendering, two small queries. */
+  /**
+   * Polled by public/assets/app.js every few seconds while a run is active:
+   * no rendering, three small queries. latest_plan tells a page with a
+   * comment being written whether its version of the plan is still the one
+   * comments go on.
+   */
   app.get(`${base}/status`, async (c) => {
     const { thread } = c.get('access');
     await expireRuns(c.env.DB, thread);
-    const [activeRun, messageCount] = await Promise.all([findActiveRun(c.env.DB, thread.id), countMessages(c.env.DB, thread.id)]);
+    const [activeRun, messageCount, latestPlan] = await Promise.all([
+      findActiveRun(c.env.DB, thread.id),
+      countMessages(c.env.DB, thread.id),
+      latestPlanId(c.env.DB, thread.id),
+    ]);
     return c.json(
-      { status: thread.status, running: activeRun !== null, signature: signatureOf(activeRun, messageCount) },
+      { status: thread.status, running: activeRun !== null, signature: signatureOf(activeRun, messageCount), latest_plan: latestPlan },
       200,
       { 'Cache-Control': 'no-store' },
     );
@@ -328,17 +368,25 @@ function threadRoutes(base: '/plans/:id' | '/s/:token', resolve: (c: ThreadConte
 
   // --- Comments --------------------------------------------------------------
 
+  /**
+   * A comment on the latest version: on one of its blocks (anchor_line, the
+   * line the block starts on), with the text people selected in it (quote),
+   * or on the whole plan. Pages from before comments had a place send the
+   * heading of a section instead (section).
+   */
   app.post(`${base}/comments`, async (c) => {
     const access = c.get('access');
     const { thread, basePath } = access;
     const form = await c.req.parseBody();
     const body = formString(form, 'body');
     const quote = formString(form, 'quote');
-    const section = formString(form, 'section').replace(/\s+/g, ' ');
+    const anchor = formString(form, 'anchor_line');
+    let section = formString(form, 'section').replace(/\s+/g, ' ');
     if (!body) return renderThread(c, { error: 'コメントを入力してください。' }, 400);
     if (body.length > LIMITS.comment || quote.length > LIMITS.quote || section.length > LIMITS.section) {
       return renderThread(c, { error: 'コメントか引用が長すぎます。' }, 400);
     }
+    if (anchor !== '' && !/^[1-9][0-9]{0,6}$/.test(anchor)) return renderThread(c, { error: 'コメントする場所の指定が正しくありません。' }, 400);
     const limited = `このスレッドへのコメントは 1 時間に ${COMMENTS_PER_HOUR_LIMIT} 件までです。しばらくしてから書いてください。`;
     const since = now() - 3600;
     if ((await countCommentsSince(c.env.DB, thread.id, since)) >= COMMENTS_PER_HOUR_LIMIT) return renderThread(c, { error: limited }, 429);
@@ -347,10 +395,21 @@ function threadRoutes(base: '/plans/:id' | '/s/:token', resolve: (c: ThreadConte
     if (!latest || formString(form, 'message_id') !== latest.id) {
       return renderThread(c, { error: '計画書が更新されています。最新の版を読んでから、もう一度コメントしてください。' }, 409);
     }
+    // The block has to be one of that version; its section is the heading it is under.
+    let anchorLine: number | null = null;
+    if (anchor !== '') {
+      const block = planBlocks(latest.body).find((candidate) => candidate.line === Number(anchor));
+      if (!block) {
+        return renderThread(c, { error: 'コメントする場所が計画書に見つかりません。ページを読み込み直してから、もう一度コメントしてください。' }, 409);
+      }
+      anchorLine = block.line;
+      section = (block.section ?? '').slice(0, LIMITS.section);
+    }
     const comment = await addComment(c.env.DB, {
       threadId: thread.id,
       messageId: latest.id,
       section: section || null,
+      anchorLine,
       quote: quote || null,
       body,
       author: actor(access, form),

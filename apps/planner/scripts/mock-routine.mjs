@@ -247,7 +247,11 @@ async function revisedPlanResult(request, fetchPlan) {
     title: current.title ?? request.thread?.title ?? '計画',
     markdown,
     changes: `v${current.version}${current.edited_by_user ? '（人が編集した版）' : ''}を元に、${comments.length > 0 ? `コメント ${comments.length} 件と` : ''}最後の発言を反映した。plans の受け口で取得した v${current.version} の本文は current_plan と${fetched === current.markdown ? '一致した' : '一致しなかった'}。`,
-    comment_replies: comments.map((comment) => ({ id: comment.id, resolved: true, reply: `v${current.version + 1} に反映しました（${comment.section ?? '計画書全体'}）。` })),
+    comment_replies: comments.map((comment) => ({
+      id: comment.id,
+      resolved: true,
+      reply: `v${current.version + 1} に反映しました（${comment.section ?? '計画書全体'}${comment.line ? `、${comment.line} 行目` : ''}）。`,
+    })),
   };
 }
 

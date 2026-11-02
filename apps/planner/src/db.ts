@@ -1,5 +1,6 @@
-/** Reads and writes the tables of migrations/ (0001_init.sql, 0002_versions_comments_sharing.sql). */
+/** Reads and writes the tables of migrations/ (0001_init.sql, 0002_versions_comments_sharing.sql, 0003_comment_anchors.sql). */
 import { newId } from './crypto.js';
+import { blockExcerpt, planBlocks, type PlanBlock } from './markdown.js';
 import type { CommentReply, Question } from './routine/callback.js';
 import type { MessageKind, PayloadComment, PayloadMessage, RunTask } from './routine/payload.js';
 
@@ -76,7 +77,11 @@ export interface CommentRow {
   thread_id: string;
   /** The plan version the comment is on. */
   message_id: string;
+  /** The level-2 heading the comment is under. */
   section: string | null;
+  /** The line of the version's Markdown where the block the comment is on starts; null: the whole plan. */
+  anchor_line: number | null;
+  /** The text people selected to comment on. */
   quote: string | null;
   body: string;
   author_sub: string | null;
@@ -155,20 +160,37 @@ export function toPayloadMessages(messages: readonly MessageRow[]): PayloadMessa
   });
 }
 
-/** The open comments of a thread, as the routine receives them. */
+/**
+ * The open comments of a thread, as the routine receives them. A comment on a
+ * block carries the block's line and the start of its Markdown, so the
+ * routine knows the place without reading that version.
+ */
 export function toPayloadComments(comments: readonly CommentRow[], messages: readonly MessageRow[]): PayloadComment[] {
   const versions = planVersionsById(messages);
+  const bodies = new Map(messages.map((message) => [message.id, message.body]));
+  const blocksOf = new Map<string, PlanBlock[]>();
+  const blockOf = (comment: CommentRow) => {
+    const body = bodies.get(comment.message_id);
+    if (comment.anchor_line === null || body === undefined) return null;
+    if (!blocksOf.has(comment.message_id)) blocksOf.set(comment.message_id, planBlocks(body));
+    const block = blocksOf.get(comment.message_id)!.find((candidate) => candidate.line === comment.anchor_line);
+    return block ? { line: block.line, excerpt: blockExcerpt(body, block) } : null;
+  };
   return comments
     .filter((comment) => comment.resolved_at === null)
-    .map((comment) => ({
-      id: comment.id,
-      planVersion: versions.get(comment.message_id) ?? 0,
-      section: comment.section,
-      quote: comment.quote,
-      body: comment.body,
-      author: authorLabel(comment),
-      createdAt: comment.created_at,
-    }));
+    .map((comment) => {
+      const block = blockOf(comment);
+      return {
+        id: comment.id,
+        planVersion: versions.get(comment.message_id) ?? 0,
+        section: comment.section,
+        ...(block ? { line: block.line, excerpt: block.excerpt } : {}),
+        quote: comment.quote,
+        body: comment.body,
+        author: authorLabel(comment),
+        createdAt: comment.created_at,
+      };
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -397,6 +419,15 @@ export async function countMessages(db: D1Database, threadId: string): Promise<n
   return Number(row?.count ?? 0);
 }
 
+/** The id of the latest version of the plan, the one comments go on; null before the first. */
+export async function latestPlanId(db: D1Database, threadId: string): Promise<string | null> {
+  const row = await db
+    .prepare("SELECT id FROM messages WHERE thread_id = ? AND kind = 'plan' ORDER BY seq DESC LIMIT 1")
+    .bind(threadId)
+    .first<{ id: string }>();
+  return row?.id ?? null;
+}
+
 export async function getMessage(db: D1Database, threadId: string, id: string): Promise<MessageRow | null> {
   return db.prepare('SELECT * FROM messages WHERE thread_id = ? AND id = ?').bind(threadId, id).first<MessageRow>();
 }
@@ -421,10 +452,11 @@ export async function countCommentsSince(db: D1Database, threadId: string, since
 }
 
 /**
- * Adds a comment on a plan version of the thread. Null when the message is
- * not a plan of the thread, or when the thread already took `limit.count`
- * comments since `limit.since` (checked in the insert, so parallel requests
- * cannot pass it together).
+ * Adds a comment on a plan version of the thread, on one of its blocks
+ * (anchorLine) or on the whole plan. Null when the message is not a plan of
+ * the thread, or when the thread already took `limit.count` comments since
+ * `limit.since` (checked in the insert, so parallel requests cannot pass it
+ * together).
  */
 export async function addComment(
   db: D1Database,
@@ -432,6 +464,7 @@ export async function addComment(
     threadId: string;
     messageId: string;
     section: string | null;
+    anchorLine?: number | null;
     quote: string | null;
     body: string;
     author: Author;
@@ -440,8 +473,8 @@ export async function addComment(
 ): Promise<CommentRow | null> {
   return db
     .prepare(
-      'INSERT INTO comments (id, thread_id, message_id, section, quote, body, author_sub, author_name, created_at) ' +
-        "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM messages WHERE id = ? AND thread_id = ? AND kind = 'plan') " +
+      'INSERT INTO comments (id, thread_id, message_id, section, anchor_line, quote, body, author_sub, author_name, created_at) ' +
+        "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM messages WHERE id = ? AND thread_id = ? AND kind = 'plan') " +
         'AND (SELECT COUNT(*) FROM comments WHERE thread_id = ? AND created_at >= ?) < ? RETURNING *',
     )
     .bind(
@@ -449,6 +482,7 @@ export async function addComment(
       input.threadId,
       input.messageId,
       input.section,
+      input.anchorLine ?? null,
       input.quote,
       input.body,
       input.author.sub,

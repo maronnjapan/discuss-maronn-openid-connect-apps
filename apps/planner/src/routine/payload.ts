@@ -55,6 +55,10 @@ export interface PayloadComment {
   /** The plan version the comment was made on. */
   planVersion: number;
   section?: string | null;
+  /** A comment on a block of the plan: the line of that version's Markdown where the block starts. */
+  line?: number | null;
+  /** The start of the block's Markdown, on one line. */
+  excerpt?: string | null;
   quote?: string | null;
   body: string;
   author?: string | null;
@@ -117,6 +121,8 @@ interface CommentEntry {
   id: string;
   plan_version: number;
   section?: string;
+  line?: number;
+  excerpt?: string;
   quote?: string;
   body: string;
   author?: string;
@@ -213,6 +219,8 @@ function commentEntry(comment: PayloadComment): CommentEntry {
     id: comment.id,
     plan_version: comment.planVersion,
     ...(comment.section ? { section: comment.section } : {}),
+    ...(comment.line ? { line: comment.line } : {}),
+    ...(comment.line && comment.excerpt ? { excerpt: comment.excerpt } : {}),
     ...(comment.quote ? { quote: comment.quote } : {}),
     body: comment.body,
     ...(comment.author ? { author: comment.author } : {}),
@@ -408,8 +416,16 @@ export function renderConversation(
   }
   if (comments.length > 0) {
     const items = comments.map((comment) => {
-      const where = [`v${comment.planVersion}`, comment.section ? `節「${comment.section}」` : '', comment.author ?? ''].filter(Boolean).join('、');
+      const where = [
+        `v${comment.planVersion}`,
+        comment.section ? `節「${comment.section}」` : '',
+        comment.line ? `${comment.line} 行目` : comment.section ? '' : '計画書全体',
+        comment.author ?? '',
+      ]
+        .filter(Boolean)
+        .join('、');
       const lines = [`## ${comment.id}（${where}、${iso(comment.createdAt)}）`, ''];
+      if (comment.line && comment.excerpt) lines.push(`コメントしたブロック（${comment.line} 行目から）:`, '', fenced(comment.excerpt), '');
       if (comment.quote) lines.push(...comment.quote.split('\n').map((line) => `> ${line}`), '');
       lines.push(fenced(comment.body));
       return lines.join('\n');

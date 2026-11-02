@@ -247,6 +247,20 @@ describe('buildRoutinePayload', () => {
         },
       ]);
     });
+
+    it('should carry the line and the start of the block a comment is on', () => {
+      const onBlock = { ...comment, line: 15, excerpt: 'テスト', quote: null };
+      expect(parse([request, plan(2, 1)], { comments: [onBlock] }).comments[0]).toEqual({
+        id: 'cmt_0123456789abcdef01234567',
+        plan_version: 1,
+        section: 'テスト計画',
+        line: 15,
+        excerpt: 'テスト',
+        body: 'E2E も入れてほしい',
+        author: 'Bob（ゲスト）',
+        created_at: '2026-11-01T02:26:50.000Z',
+      });
+    });
   });
 
   describe('Length limit', () => {
@@ -334,6 +348,17 @@ describe('renderConversation', () => {
     expect(text).toContain('## 2. 計画書 v1「DPoP 対応の実装計画」（Claude Code、2026-11-01T02:26:42.000Z）\n\n本文は省きました（GET /api/routine/runs/<run_id>/plans/1 で取得できます）。\n\n変更点: 初版');
     expect(text).toContain('# 最新の計画書（v2）\n\n```markdown\n# DPoP 対応の実装計画');
     expect(text).toContain('# 未解決のコメント（1 件）\n\n## cmt_0123456789abcdef01234567（v2、節「概要」、Bob、2026-11-01T02:26:50.000Z）\n\n> 版 2\n\n```markdown\n短く\n```');
+  });
+
+  it('should name the block of a comment by its line, and a comment without one as on the whole plan', () => {
+    const text = renderConversation({ title: 'T' }, [request, plan(2, 1)], [
+      { id: 'cmt_0123456789abcdef01234567', planVersion: 1, section: '概要', line: 5, excerpt: '版 1 の概要。', body: '短く', author: 'Bob', createdAt: 1_793_500_010 },
+      { id: 'cmt_89abcdef0123456789abcdef', planVersion: 1, body: '全体に', author: 'Bob', createdAt: 1_793_500_011 },
+    ]);
+    expect(text).toContain(
+      '## cmt_0123456789abcdef01234567（v1、節「概要」、5 行目、Bob、2026-11-01T02:26:50.000Z）\n\nコメントしたブロック（5 行目から）:\n\n```markdown\n版 1 の概要。\n```\n\n```markdown\n短く\n```',
+    );
+    expect(text).toContain('## cmt_89abcdef0123456789abcdef（v1、計画書全体、Bob、2026-11-01T02:26:51.000Z）');
   });
 });
 

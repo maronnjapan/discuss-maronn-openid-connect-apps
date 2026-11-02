@@ -51,3 +51,15 @@ describe('migration 0002', () => {
     });
   });
 });
+
+describe('migration 0003', () => {
+  it('should keep the comments made before it as comments without a place', () => {
+    const d1 = createD1({ migrations: ['0001_init.sql', '0002_versions_comments_sharing.sql'] });
+    d1.raw.exec(`
+      INSERT INTO threads (id, owner_sub, owner_name, title, status, created_at, updated_at) VALUES ('thr_1', 'alice', 'Alice', 'DPoP', 'plan_ready', 1, 2);
+      INSERT INTO comments (id, thread_id, message_id, section, quote, body, created_at) VALUES ('cmt_1', 'thr_1', 'msg_2', 'テスト計画', 'x', '直して', 3);
+    `);
+    d1.applyMigration('0003_comment_anchors.sql');
+    expect({ ...d1.raw.prepare('SELECT id, section, anchor_line FROM comments').get() }).toEqual({ id: 'cmt_1', section: 'テスト計画', anchor_line: null });
+  });
+});

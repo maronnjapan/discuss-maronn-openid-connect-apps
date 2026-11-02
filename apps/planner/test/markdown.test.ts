@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { renderMarkdown } from '../src/markdown.js';
+import { blockExcerpt, planBlocks, renderMarkdown, splitAtCommentSlots } from '../src/markdown.js';
 
 describe('renderMarkdown', () => {
   describe('CommonMark', () => {
@@ -118,6 +118,122 @@ describe('renderMarkdown', () => {
         { level: 2, text: '概要', id: 'm1-h2' },
         { level: 3, text: 'config.ts の変更', id: 'm1-h3' },
       ]);
+    });
+  });
+
+  // The blocks of a plan are where people comment: each is named by the line it starts on.
+  describe('Plan blocks', () => {
+    const plan = [
+      '# 計画', // 1
+      '',
+      '## 概要', // 3
+      '',
+      '本文です。', // 5
+      '続き。',
+      '',
+      '| x |', // 8
+      '| - |',
+      '| 1 |',
+      '',
+      '```ts', // 12
+      'const a = 1;',
+      '```',
+      '',
+      '```mermaid', // 16
+      'sequenceDiagram',
+      '```',
+      '',
+      '## テスト計画', // 20
+      '',
+      '> 注意', // 22
+    ].join('\n');
+
+    it('should mark headings, paragraphs, tables and code blocks with their first line and a comment slot after each', () => {
+      expect(renderMarkdown(plan, { idPrefix: 'p', blocks: true }).html).toBe(
+        '<h1 id="p-h1" data-line="1">計画</h1>\n<!--comment-slot:1-->' +
+          '<h2 id="p-h2" data-line="3">概要</h2>\n<!--comment-slot:3-->' +
+          '<p data-line="5">本文です。\n続き。</p>\n<!--comment-slot:5-->' +
+          '<div class="table-wrap" data-line="8"><table>\n<thead>\n<tr>\n<th>x</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>1</td>\n</tr>\n</tbody>\n</table></div>\n<!--comment-slot:8-->' +
+          '<pre data-line="12"><code class="language-ts">const a = 1;\n</code></pre>\n<!--comment-slot:12-->' +
+          '<pre class="mermaid" data-line="16">sequenceDiagram\n</pre>\n<!--comment-slot:16-->' +
+          '<h2 id="p-h3" data-line="20">テスト計画</h2>\n<!--comment-slot:20-->' +
+          // A paragraph in a block quote is a block of its own; its comments stay in the quote.
+          '<blockquote>\n<p data-line="22">注意</p>\n<!--comment-slot:22--></blockquote>\n',
+      );
+    });
+
+    it('should list the blocks with the level-2 heading each is under', () => {
+      expect(renderMarkdown(plan, { blocks: true }).blocks).toEqual([
+        { line: 1, endLine: 1, kind: 'heading', section: null, level: 1, text: '計画' },
+        { line: 3, endLine: 3, kind: 'heading', section: '概要', level: 2, text: '概要' },
+        { line: 5, endLine: 6, kind: 'paragraph', section: '概要' },
+        { line: 8, endLine: 10, kind: 'table', section: '概要' },
+        { line: 12, endLine: 14, kind: 'code', section: '概要' },
+        { line: 16, endLine: 18, kind: 'code', section: '概要' },
+        { line: 20, endLine: 20, kind: 'heading', section: 'テスト計画', level: 2, text: 'テスト計画' },
+        { line: 22, endLine: 22, kind: 'paragraph', section: 'テスト計画' },
+      ]);
+    });
+
+    it('should give the same blocks without rendering', () => {
+      expect(planBlocks(plan)).toEqual(renderMarkdown(plan, { blocks: true }).blocks);
+    });
+
+    it('should put the comments on a list item next to its own text, before its nested list', () => {
+      expect(renderMarkdown('- 親\n  - 子\n- [ ] タスク', { blocks: true }).html).toBe(
+        '<ul class="contains-task-list">\n' +
+          '<li data-line="1">親<!--comment-slot:1--><ul>\n<li data-line="2">子<!--comment-slot:2--></li>\n</ul>\n</li>\n' +
+          '<li class="task-list-item" data-line="3"><input class="task-list-item-checkbox" disabled="" type="checkbox"> タスク<!--comment-slot:3--></li>\n' +
+          '</ul>\n',
+      );
+    });
+
+    it('should keep the paragraphs and code of a list item in the item, and take the innermost of items on one line', () => {
+      const { html, blocks } = renderMarkdown('1. 手順\n\n   ```ts\n   x\n   ```\n\n- - 内側', { blocks: true });
+      expect(html).toBe(
+        '<ol>\n<li data-line="1">\n<p>手順</p>\n<pre><code class="language-ts">x\n</code></pre>\n<!--comment-slot:1--></li>\n</ol>\n' +
+          '<ul>\n<li>\n<ul>\n<li data-line="7">内側<!--comment-slot:7--></li>\n</ul>\n</li>\n</ul>\n',
+      );
+      expect(blocks.map((block) => [block.line, block.kind])).toEqual([
+        [1, 'item'],
+        [7, 'item'],
+      ]);
+    });
+
+    it('should leave footnotes out', () => {
+      const { blocks } = renderMarkdown('本文[^1]\n\n[^1]: 補足', { blocks: true });
+      expect(blocks.map((block) => block.line)).toEqual([1]);
+    });
+
+    it('should not mark anything without the option', () => {
+      expect(renderMarkdown('## 概要\n\n本文', { idPrefix: 'p' })).toEqual({
+        html: '<h2 id="p-h1">概要</h2>\n<p>本文</p>\n',
+        headings: [{ level: 2, text: '概要', id: 'p-h1' }],
+        blocks: [],
+      });
+    });
+
+    it('should split the HTML at the comment slots', () => {
+      const { html } = renderMarkdown('## 概要\n\n本文', { blocks: true });
+      expect(splitAtCommentSlots(html)).toEqual({
+        html: '<h2 id="md-h1" data-line="1">概要</h2>\n',
+        slots: [
+          { line: 1, html: '<p data-line="3">本文</p>\n' },
+          { line: 3, html: '' },
+        ],
+      });
+    });
+
+    // A slot is an HTML comment, which the text of a plan cannot write (raw HTML is escaped).
+    it('should not take a comment slot written in the text for one', () => {
+      const { html } = renderMarkdown('<!--comment-slot:9-->\n\n`<!--comment-slot:9-->`', { blocks: true });
+      expect(splitAtCommentSlots(html).slots.map((slot) => slot.line)).toEqual([1, 3]);
+    });
+
+    it('should give the Markdown of a block on one line, cut to a length', () => {
+      const source = '- 親\n  - 子\n\n| a | b |\n| - | - |';
+      expect(blockExcerpt(source, { line: 1, endLine: 2 })).toBe('- 親 - 子');
+      expect(blockExcerpt(source, { line: 4, endLine: 5 }, 8)).toBe('| a | b…');
     });
   });
 });

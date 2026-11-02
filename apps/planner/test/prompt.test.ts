@@ -113,6 +113,14 @@ describe('routinePrompt one plan at a time', () => {
     expect(routinePrompt(settings)).toContain('人が書き換えた箇所を元に戻しません。');
   });
 
+  // A comment names the block it is on by its line in the version it was made on.
+  it('should tell where each comment is, also on an earlier version', () => {
+    const prompt = routinePrompt(settings);
+    expect(prompt).toContain('line と excerpt（コメントした場所）');
+    expect(prompt).toContain('line の無いコメントは、計画書全体（section があればその節）への指摘です。');
+    expect(prompt).toContain('excerpt と quote を手がかりに current_plan の該当箇所を探します（そのために古い版を取得しません）。');
+  });
+
   it('should answer every open comment with each plan', () => {
     const prompt = routinePrompt(settings);
     expect(prompt).toContain('changes に、current_plan の版から何をなぜ変えたかを書き、comments の各コメントへの対応を comment_replies に書く。');

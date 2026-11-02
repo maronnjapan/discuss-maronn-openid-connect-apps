@@ -207,6 +207,70 @@ input[type="text"]:focus, textarea:focus { border-color: var(--accent); outline:
 select { width: 100%; padding: 8px 10px; font: inherit; font-size: 14px; color: inherit; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
 .quote-button { position: absolute; z-index: 20; box-shadow: 0 4px 12px rgb(0 0 0 / 18%); }
 .quote-button[hidden] { display: none; }
+.comments__how { margin: 0 0 12px; }
+.comments__subtitle { font-size: 14px; margin: 12px 0 8px; }
+.comment-list__resolved > summary { cursor: pointer; font-size: 13px; color: var(--muted); margin: 2px 0; }
+.comment-list__resolved[open] > summary { margin-bottom: 8px; }
+.comment-list + .comment-list__resolved { margin-top: 8px; }
+.comment-form-panel { margin-top: 12px; }
+.comment-form-panel > summary { display: inline-flex; list-style: none; }
+.comment-form-panel > summary::-webkit-details-marker { display: none; }
+.comment-form-panel[open] > summary { margin-bottom: 10px; }
+
+/* Comments in place: under the block of the plan they are on */
+.plan-body[data-commentable] { padding-right: 36px; }
+.plan-body .comment-thread {
+  margin: 6px 0 16px; padding: 10px 12px;
+  border: 1px solid var(--line); border-left: 3px solid var(--warn); border-radius: 8px;
+  background: var(--surface-2); color: var(--fg);
+  font-size: 14px; line-height: 1.6; font-weight: 400; letter-spacing: normal;
+}
+.plan-body .comment-thread--resolved { border-left-color: var(--line); padding-top: 6px; padding-bottom: 6px; }
+.plan-body .comment-thread .comment-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.plan-body .comment-thread .comment + .comment { margin-top: 0; }
+.plan-body .comment-thread .comment { background: var(--surface); }
+.plan-body .comment-thread .comment--open { border-left: 1px solid var(--line); }
+.comment:target { box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent); }
+.draft-notice { position: fixed; z-index: 30; left: 50%; bottom: 16px; transform: translateX(-50%); display: flex; align-items: center; gap: 12px; max-width: calc(100vw - 32px); padding: 10px 14px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: 0 8px 24px rgb(0 0 0 / 16%); font-size: 14px; }
+.plan-body .comment__quote, .plan-body .comment-form .comment__quote {
+  margin: 6px 0; padding: 4px 10px; border-left: 3px solid var(--line);
+  color: var(--muted); font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.plan-body .comment__quote[hidden] { display: none; }
+.comment-thread__add { display: inline-block; margin-top: 8px; font-size: 13px; }
+.comment-thread__add[hidden] { display: none; }
+.comment-form--inline {
+  margin: 6px 0 16px; background: var(--surface); color: var(--fg);
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--line));
+  box-shadow: 0 4px 14px rgb(0 0 0 / 8%);
+  font-size: 14px; line-height: 1.6; font-weight: 400; letter-spacing: normal;
+}
+.comment-thread .comment-form--inline { margin: 8px 0 0; box-shadow: none; }
+.plan-body .comment-form__target { margin: 0; font-size: 13px; font-weight: 600; color: var(--accent); }
+.plan-body [data-line].is-comment-hover { outline: 2px dashed color-mix(in srgb, var(--accent) 45%, transparent); outline-offset: 3px; border-radius: 4px; }
+.plan-body [data-line].is-comment-target { outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent); outline-offset: 3px; border-radius: 4px; background: color-mix(in srgb, var(--accent) 6%, transparent); }
+.block-comment-button {
+  position: absolute; z-index: 15; width: 28px; height: 28px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--accent); background: var(--surface);
+  border: 1px solid var(--line); border-radius: 999px;
+  box-shadow: 0 2px 8px rgb(0 0 0 / 12%); cursor: pointer;
+}
+.block-comment-button:hover, .block-comment-button:focus-visible { color: var(--accent-fg); background: var(--accent); border-color: var(--accent); }
+.block-comment-button[hidden] { display: none; }
+/* The text each comment quotes, and the text a comment being written is about (CSS Custom Highlight API). */
+::highlight(comment-quote) { background-color: rgb(255 196 0 / 26%); }
+::highlight(comment-quote-active) { background-color: rgb(255 176 0 / 55%); }
+::highlight(comment-draft) { background-color: rgb(36 87 214 / 20%); }
+@media (prefers-color-scheme: dark) {
+  ::highlight(comment-quote) { background-color: rgb(227 179 65 / 24%); }
+  ::highlight(comment-quote-active) { background-color: rgb(227 179 65 / 48%); }
+  ::highlight(comment-draft) { background-color: rgb(111 155 255 / 30%); }
+}
+@media (max-width: 560px) {
+  .plan-body[data-commentable] { padding-right: 30px; }
+  .plan-body .comment-thread { padding: 8px 10px; }
+}
 
 /* Forms under the timeline */
 .forms { display: grid; gap: 18px; }

@@ -10,7 +10,7 @@ import type { Child } from 'hono/jsx';
 import type { CurrentUser } from '../auth/session.js';
 import { LIMITS } from '../compose.js';
 import { authorLabel, type CommentRow, type MessageRow, type RunRow, type ThreadRow } from '../db.js';
-import type { Heading } from '../markdown.js';
+import { splitAtCommentSlots, type Heading, type PlanBlock, type PlanBlockKind } from '../markdown.js';
 import { describeSectionChanges, hasSectionChanges, type DiffHunk, type SectionChanges } from '../plan-diff.js';
 import type { Question } from '../routine/callback.js';
 import { Flash, formatDate, Layout, MarkdownField, StatusBadge } from './layout.js';
@@ -48,6 +48,12 @@ export interface TimelineItem {
   summaryHtml?: string;
   /** Plans: the comments on this version. */
   comments?: CommentView[];
+  /** Plans: the blocks people comment on (headings, paragraphs, list items, tables, code). */
+  blocks?: PlanBlock[];
+  /** Plans: the comments shown under each block, by the line the block starts on. */
+  threads?: Map<number, CommentView[]>;
+  /** Plans: the comments on the whole plan, shown after it. */
+  planComments?: CommentView[];
   /** Prompt requests and implementation prompts: the plan version they are about. */
   basePlanVersion?: number;
 }
@@ -171,7 +177,7 @@ function GuestNameField(props: { suffix: string }) {
   );
 }
 
-function CommentItem(props: { view: CommentView; access: ThreadAccessView; canComment: boolean }) {
+function CommentItem(props: { view: CommentView; access: ThreadAccessView; canComment: boolean; showSection?: boolean }) {
   const { comment } = props.view;
   const resolved = comment.resolved_at !== null;
   const base = `${props.access.basePath}/comments/${comment.id}`;
@@ -184,10 +190,14 @@ function CommentItem(props: { view: CommentView; access: ThreadAccessView; canCo
         <time class="muted" datetime={new Date(comment.created_at * 1000).toISOString()}>
           {formatDate(comment.created_at)}
         </time>
-        {comment.section ? <span class="comment__section">§ {comment.section}</span> : null}
+        {props.showSection && comment.section ? <span class="comment__section">§ {comment.section}</span> : null}
         <span class={`badge ${resolved ? 'badge--resolved' : 'badge--open'}`}>{resolved ? '解決済み' : '未解決'}</span>
       </div>
-      {comment.quote ? <blockquote class="comment__quote">{comment.quote}</blockquote> : null}
+      {comment.quote ? (
+        <blockquote class="comment__quote" data-comment-quote-text>
+          {comment.quote}
+        </blockquote>
+      ) : null}
       <div class="markdown-body comment__body">{raw(props.view.html)}</div>
       {props.view.replyHtml ? (
         <div class="comment__reply">
@@ -223,59 +233,162 @@ function CommentItem(props: { view: CommentView; access: ThreadAccessView; canCo
   );
 }
 
-function CommentForm(props: { item: TimelineItem; access: ThreadAccessView }) {
-  const id = props.item.message.id;
-  const sections = props.item.headings.filter((heading) => heading.level === 2);
+/** Open comments first, then the resolved ones folded. */
+function CommentList(props: { views: CommentView[]; access: ThreadAccessView; showSection?: boolean }) {
+  const open = props.views.filter((view) => view.comment.resolved_at === null);
+  const resolved = props.views.filter((view) => view.comment.resolved_at !== null);
+  const item = (view: CommentView) => <CommentItem view={view} access={props.access} canComment={true} showSection={props.showSection} />;
   return (
-    <form method="post" action={`${props.access.basePath}/comments`} class="comment-form" data-comment-form={id} data-submit-once>
-      <input type="hidden" name="message_id" value={id} />
-      <div class="comment-form__row">
-        <div class="field">
-          <label for={`comment-section-${id}`}>対象の節</label>
-          <select id={`comment-section-${id}`} name="section" data-comment-section>
-            <option value="">計画書全体</option>
-            {sections.map((heading) => (
-              <option value={heading.text}>{heading.text}</option>
-            ))}
-          </select>
-        </div>
-        {props.access.anonymous ? <GuestNameField suffix={`comment-${id}`} /> : null}
-      </div>
-      <div class="field">
-        <label for={`comment-quote-${id}`}>引用（任意）</label>
+    <>
+      {open.length > 0 ? <ol class="comment-list">{open.map(item)}</ol> : null}
+      {resolved.length > 0 ? (
+        <details class="comment-list__resolved">
+          <summary>解決済みのコメント {resolved.length} 件</summary>
+          <ol class="comment-list">{resolved.map(item)}</ol>
+        </details>
+      ) : null}
+    </>
+  );
+}
+
+const BLOCK_LABELS: Record<PlanBlockKind, string> = {
+  heading: '見出し',
+  paragraph: '段落',
+  item: 'リストの項目',
+  table: '表',
+  code: 'コードブロック',
+};
+
+const blockLabel = (block: PlanBlock | undefined) =>
+  !block ? 'この場所' : block.kind === 'heading' ? `見出し「${block.text ?? ''}」` : BLOCK_LABELS[block.kind];
+
+/** The comments on one block of the plan, shown right under it. */
+function CommentThread(props: { line: number; block: PlanBlock | undefined; views: CommentView[]; access: ThreadAccessView; commentable: boolean }) {
+  const settled = props.views.every((view) => view.comment.resolved_at !== null);
+  return (
+    <aside
+      class={`comment-thread${settled ? ' comment-thread--resolved' : ''}`}
+      data-thread-line={props.line}
+      aria-label={`${blockLabel(props.block)}へのコメント`}
+    >
+      <CommentList views={props.views} access={props.access} />
+      {props.commentable ? (
+        <button type="button" class="link-button comment-thread__add" data-comment-add={props.line} hidden>
+          ここにコメントを追加
+        </button>
+      ) : null}
+    </aside>
+  );
+}
+
+/**
+ * The plan with the comments on each block right under it. The latest
+ * version is commentable: public/assets/app.js opens the form of
+ * InlineCommentForm under a block when people point at it or select text in it.
+ */
+function PlanBody(props: { item: TimelineItem; access: ThreadAccessView; commentable: boolean }) {
+  const { item } = props;
+  const { html, slots } = splitAtCommentSlots(item.html);
+  const blocks = new Map((item.blocks ?? []).map((block) => [block.line, block]));
+  return (
+    <div class="markdown-body plan-body" data-plan-body={item.message.id} data-commentable={props.commentable ? 'true' : undefined}>
+      {raw(html)}
+      {slots.map((slot) => {
+        const views = item.threads?.get(slot.line) ?? [];
+        return (
+          <>
+            {views.length > 0 ? (
+              <CommentThread line={slot.line} block={blocks.get(slot.line)} views={views} access={props.access} commentable={props.commentable} />
+            ) : null}
+            {raw(slot.html)}
+          </>
+        );
+      })}
+    </div>
+  );
+}
+
+/** The form public/assets/app.js puts under a block of the latest plan, with the block's line and the selected text. */
+function InlineCommentForm(props: { item: TimelineItem; access: ThreadAccessView }) {
+  const id = props.item.message.id;
+  return (
+    <template data-comment-template={id}>
+      <form method="post" action={`${props.access.basePath}/comments`} class="comment-form comment-form--inline" data-submit-once data-inline-comment-form>
+        <input type="hidden" name="message_id" value={id} />
+        <input type="hidden" name="anchor_line" value="" data-comment-anchor />
+        <input type="hidden" name="quote" value="" data-comment-quote />
+        <p class="comment-form__target" data-comment-target></p>
+        <blockquote class="comment__quote" data-comment-quote-preview hidden></blockquote>
+        {props.access.anonymous ? <GuestNameField suffix={`inline-${id}`} /> : null}
         <textarea
-          id={`comment-quote-${id}`}
-          name="quote"
-          rows={2}
-          maxlength={LIMITS.quote}
-          placeholder="計画書の文章を選択して「この部分にコメント」を押すと、ここに入ります"
-          data-comment-quote
-        ></textarea>
-      </div>
-      <div class="field">
-        <label for={`comment-body-${id}`}>コメント</label>
-        <textarea
-          id={`comment-body-${id}`}
           name="body"
           rows={3}
           maxlength={LIMITS.comment}
           required
-          placeholder="例：UC-2 のエラー応答は RFC 9449 §7.1 の形にしてほしい"
+          aria-label="コメント"
+          placeholder="例：ここのエラー応答は RFC 9449 §7.1 の形にしてほしい"
           data-comment-body
         ></textarea>
-        <p class="hint">未解決のコメントは、次に Claude Code へ送るときに計画書と一緒に渡ります。</p>
-      </div>
-      <div class="form-actions">
-        <button type="submit" class="button button--small">
-          コメントする
-        </button>
-      </div>
-    </form>
+        <div class="form-actions">
+          <button type="button" class="button button--small button--ghost" data-comment-cancel>
+            キャンセル
+          </button>
+          <button type="submit" class="button button--small">
+            コメントする
+          </button>
+        </div>
+      </form>
+    </template>
   );
 }
 
+/** A comment on the whole plan, or on a section chosen from its headings (without a pointer or scripts). */
+function CommentForm(props: { item: TimelineItem; access: ThreadAccessView }) {
+  const id = props.item.message.id;
+  const headings = (props.item.blocks ?? []).filter((block) => block.kind === 'heading' && (block.level === 2 || block.level === 3));
+  return (
+    <details class="comment-form-panel">
+      <summary class="button button--small button--ghost">計画書全体にコメントする</summary>
+      <form method="post" action={`${props.access.basePath}/comments`} class="comment-form" data-comment-form={id} data-submit-once>
+        <input type="hidden" name="message_id" value={id} />
+        <div class="comment-form__row">
+          <div class="field">
+            <label for={`comment-target-${id}`}>対象</label>
+            <select id={`comment-target-${id}`} name="anchor_line">
+              <option value="">計画書全体</option>
+              {headings.map((block) => (
+                <option value={String(block.line)}>{`${block.level === 3 ? '　' : ''}${block.text ?? ''}`}</option>
+              ))}
+            </select>
+          </div>
+          {props.access.anonymous ? <GuestNameField suffix={`comment-${id}`} /> : null}
+        </div>
+        <div class="field">
+          <label for={`comment-body-${id}`}>コメント</label>
+          <textarea
+            id={`comment-body-${id}`}
+            name="body"
+            rows={3}
+            maxlength={LIMITS.comment}
+            required
+            placeholder="例：全体として、既存の API を壊さない方針を先に書いてほしい"
+          ></textarea>
+          <p class="hint">見出しを選ぶと、コメントはその見出しの下に表示します。未解決のコメントは、次に Claude Code へ送るときに計画書と一緒に渡ります。</p>
+        </div>
+        <div class="form-actions">
+          <button type="submit" class="button button--small">
+            コメントする
+          </button>
+        </div>
+      </form>
+    </details>
+  );
+}
+
+/** After the plan: the count of its comments, the comments on the whole plan, and (latest version) the form for one. */
 function CommentsSection(props: { item: TimelineItem; access: ThreadAccessView; withForm: boolean }) {
   const comments = props.item.comments ?? [];
+  const planComments = props.item.planComments ?? [];
   const open = comments.filter((view) => view.comment.resolved_at === null).length;
   if (comments.length === 0 && !props.withForm) return null;
   return (
@@ -286,12 +399,16 @@ function CommentsSection(props: { item: TimelineItem; access: ThreadAccessView; 
           未解決 {open} 件 / 全 {comments.length} 件
         </span>
       </h3>
-      {comments.length > 0 ? (
-        <ol class="comment-list">
-          {comments.map((view) => (
-            <CommentItem view={view} access={props.access} canComment={true} />
-          ))}
-        </ol>
+      {props.withForm ? (
+        <p class="hint comments__how">
+          段落や見出し、リストの項目、表、コードには、その場所でコメントできます。本文にポインタを合わせると右端に出るボタンを押すか、文章を選んで「この部分にコメント」を押してください。コメントは本文のその場所に表示します。
+        </p>
+      ) : null}
+      {planComments.length > 0 ? (
+        <div class="comments__plan">
+          <h4 class="comments__subtitle">計画書全体へのコメント</h4>
+          <CommentList views={planComments} access={props.access} showSection={true} />
+        </div>
       ) : null}
       {props.withForm ? <CommentForm item={props.item} access={props.access} /> : null}
     </section>
@@ -326,10 +443,9 @@ function PlanCard(props: { item: TimelineItem; access: ThreadAccessView; latestP
       {message.title ? <p class="message__title">{message.title}</p> : null}
       <ChangeInfo item={item} summaryLabel={message.role === 'user' ? '編集メモ' : '変更点'} />
       <Toc headings={item.headings} />
-      <div class="markdown-body plan-body" data-plan-body={message.id}>
-        {raw(item.html)}
-      </div>
+      <PlanBody item={item} access={access} commentable={item.isLatest === true} />
       <CommentsSection item={item} access={access} withForm={item.isLatest === true} />
+      {item.isLatest ? <InlineCommentForm item={item} access={access} /> : null}
     </>
   );
   const head = (
@@ -633,7 +749,15 @@ export function ThreadPage(props: {
       user={props.user}
       wide
       {...(owner ? {} : { headerNote: '共有リンクで表示中' })}
-      bodyAttributes={running ? { 'data-poll-url': `${access.basePath}/status`, 'data-poll-signature': view.signature } : {}}
+      bodyAttributes={
+        running
+          ? {
+              'data-poll-url': `${access.basePath}/status`,
+              'data-poll-signature': view.signature,
+              'data-latest-plan': view.latestPlan?.message.id ?? '',
+            }
+          : {}
+      }
     >
       <div class="page-head">
         <div>
@@ -728,9 +852,25 @@ export function ThreadPage(props: {
           {view.latestPlan ? <PromptForm access={access} plan={view.latestPlan} openComments={view.openComments.length} /> : null}
         </div>
       ) : null}
-      <button type="button" class="quote-button button button--small" data-quote-button hidden>
-        この部分にコメント
-      </button>
+      {view.latestPlan ? (
+        <>
+          <button type="button" class="quote-button button button--small" data-quote-button hidden>
+            この部分にコメント
+          </button>
+          <button type="button" class="block-comment-button" data-block-comment-button hidden title="この場所にコメント" aria-label="この場所にコメント">
+            <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true" focusable="false">
+              <path
+                d="M4 3h12a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H9.5L6 17v-3H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.6"
+                stroke-linejoin="round"
+              />
+              <path d="M10 6v5M7.5 8.5h5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+            </svg>
+          </button>
+        </>
+      ) : null}
     </Layout>
   );
 }
@@ -787,7 +927,8 @@ export function EditPlanPage(props: {
                     <span>
                       <span class="muted">
                         v{planVersion}
-                        {comment.section ? ` § ${comment.section}` : ''}・{authorLabel(comment)}：
+                        {comment.section ? ` § ${comment.section}` : ''}
+                        {comment.anchor_line !== null ? `（${comment.anchor_line} 行目）` : ''}・{authorLabel(comment)}：
                       </span>
                       {comment.body.length > 160 ? `${comment.body.slice(0, 160)}…` : comment.body}
                     </span>

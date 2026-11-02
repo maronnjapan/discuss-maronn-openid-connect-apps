@@ -109,6 +109,7 @@ let threadPath;
 let runId;
 let shareUrl;
 let editedMarkdown;
+let stepLine;
 
 /** The fire text of a run, as the mock routine shows it for its session. */
 async function fireOf(sessionUrl) {
@@ -227,18 +228,19 @@ await step('回答を送ると計画書が返り、Markdown として表示さ�
 
   const html = await (await request(`${PLANNER}${threadPath}`)).text();
   assert.match(html, /計画書 v1/);
-  assert.match(html, /<h1 id="msg_[0-9a-f]+-h1">DPoP 対応の実装計画<\/h1>/);
-  assert.match(html, /<div class="table-wrap"><table>/);
-  assert.match(html, /<pre class="mermaid">sequenceDiagram/);
-  assert.match(html, /<pre><code class="language-ts">/);
+  // Each block of the plan carries the line of the Markdown it starts on, where comments go.
+  assert.match(html, /<h1 id="msg_[0-9a-f]+-h1" data-line="1">DPoP 対応の実装計画<\/h1>/);
+  assert.match(html, /<div class="table-wrap" data-line="\d+"><table>/);
+  assert.match(html, /<pre class="mermaid" data-line="\d+">sequenceDiagram/);
+  assert.match(html, /<pre data-line="\d+"><code class="language-ts">/);
   assert.match(html, /class="task-list-item-checkbox" disabled="" type="checkbox"/);
   assert.match(html, /<s>nonce を必須にする<\/s>/);
   assert.match(html, /<summary>目次<\/summary>/);
   // The plan names the use cases and the departures from the specifications.
-  assert.match(html, /<h2 id="msg_[0-9a-f]+-h\d+">ユースケース<\/h2>/);
-  assert.match(html, /<h2 id="msg_[0-9a-f]+-h\d+">仕様から外れる独自実装<\/h2>/);
+  assert.match(html, /<h2 id="msg_[0-9a-f]+-h\d+" data-line="\d+">ユースケース<\/h2>/);
+  assert.match(html, /<h2 id="msg_[0-9a-f]+-h\d+" data-line="\d+">仕様から外れる独自実装<\/h2>/);
   // The test plan goes from the use cases to the features to the test cases.
-  assert.match(html, /<h3 id="msg_[0-9a-f]+-h\d+">ユースケースの整理<\/h3>[\s\S]*<h3 id="msg_[0-9a-f]+-h\d+">ユースケースを満たす機能<\/h3>[\s\S]*<h3 id="msg_[0-9a-f]+-h\d+">機能ごとのテストケース<\/h3>/);
+  assert.match(html, /<h3 id="msg_[0-9a-f]+-h\d+" data-line="\d+">ユースケースの整理<\/h3>[\s\S]*<h3 id="msg_[0-9a-f]+-h\d+" data-line="\d+">ユースケースを満たす機能<\/h3>[\s\S]*<h3 id="msg_[0-9a-f]+-h\d+" data-line="\d+">機能ごとのテストケース<\/h3>/);
   // The reply was composed from the answer form.
   assert.match(html, /<strong>選択:<\/strong> packages\/experimental/);
   assert.match(html, /既存の API は壊さない/);
@@ -289,21 +291,34 @@ await step('計画書を編集すると新しい版として残り、差分を�
   assert.match(staleHtml, /古い版に重ねた編集/);
 });
 
-await step('最新の計画書にコメントでき、未解決のコメントとして数えられる', async () => {
+await step('最新の計画書の段落や項目にコメントでき、その場所に表示される', async () => {
   const html = await (await request(`${PLANNER}${threadPath}`)).text();
   const plan = /data-comment-form="(msg_[0-9a-f]{24})"/.exec(html)?.[1];
   assert.ok(plan, 'comment form not found');
+  // The block a comment is on is named by the line it starts on: here the first step of the implementation.
+  const item = /<li class="task-list-item" data-line="(\d+)"><input class="task-list-item-checkbox" disabled="" type="checkbox"> <code>verifyDpopProof\(\)<\/code> の失敗ケースのテストを書く/.exec(html);
+  assert.ok(item, 'list item not found');
+  stepLine = Number(item[1]);
   const response = await request(`${PLANNER}${threadPath}/comments`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: PLANNER },
-    body: form({ message_id: plan, section: 'テスト計画', quote: 'verifyDpopProof', body: 'E2E のケースも足してほしい' }),
+    body: form({ message_id: plan, anchor_line: String(stepLine), quote: 'verifyDpopProof', body: 'E2E のケースも足してほしい' }),
   });
   assert.equal(response.status, 303);
   assert.match(response.headers.get('Location'), /#cmt_[0-9a-f]{24}$/);
   const after = await (await request(`${PLANNER}${threadPath}`)).text();
-  assert.match(after, /E2E のケースも足してほしい/);
-  assert.match(after, /§ テスト計画/);
+  // Right under the item, before the next one.
+  const placed = new RegExp(`data-line="${stepLine}">[\\s\\S]*?の失敗ケースのテストを書く<aside class="comment-thread" data-thread-line="${stepLine}"[\\s\\S]*?E2E のケースも足してほしい[\\s\\S]*?</aside></li>`);
+  assert.match(after, placed);
+  assert.match(after, /<blockquote class="comment__quote" data-comment-quote-text="true">verifyDpopProof<\/blockquote>/);
   assert.match(after, /未解決 1 件 \/ 全 1 件/);
+  // A place that is not a block of the latest version is refused.
+  const nowhere = await request(`${PLANNER}${threadPath}/comments`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: PLANNER },
+    body: form({ message_id: plan, anchor_line: '2', body: '空行へ' }),
+  });
+  assert.equal(nowhere.status, 409);
 
   // People can resolve a comment and open it again.
   const commentPath = new URL(response.headers.get('Location'), PLANNER).hash.slice(1);
@@ -374,10 +389,14 @@ await step('共有リンクからの投稿でルーチンが動き、依頼に�
   assert.equal(plans[1].changes, '未決事項を追記した');
   // The whole fire holds the text of one version only.
   assert.equal(JSON.stringify(fire).split('## 仕様から外れる独自実装').length - 1, 1);
-  assert.deepEqual(fire.comments.map((comment) => [comment.plan_version, comment.section ?? null, comment.body]), [
-    [2, 'テスト計画', 'E2E のケースも足してほしい'],
-    [2, null, 'ゲストからの指摘です'],
-  ]);
+  // A comment on a block carries its line and the start of its Markdown; one on the whole plan has neither.
+  assert.deepEqual(
+    fire.comments.map((comment) => [comment.plan_version, comment.section ?? null, comment.line ?? null, comment.excerpt ?? null, comment.body]),
+    [
+      [2, '実装ステップ', stepLine, '- [ ] `verifyDpopProof()` の失敗ケースのテストを書く', 'E2E のケースも足してほしい'],
+      [2, null, null, null, 'ゲストからの指摘です'],
+    ],
+  );
 
   const html = await (await anonymous(shareUrl)).text();
   assert.match(html, /計画書 v3・最新/);
